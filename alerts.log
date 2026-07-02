@@ -1,1 +1,5 @@
 [2026-07-01 12:48:57] ALERT Level 3 (CRITICAL) - Frame ID: test_input.jpg - Max Width: 1.32mm, Length: 89.0mm. Action Required: Immediate shutdown & emergency maintenance inspection
+[2026-07-02 14:45:09] ALERT Level 3 (CRITICAL) - Frame ID: test_input.jpg - Max Width: 1.32mm, Length: 89.0mm. Action Required: Immediate shutdown & emergency maintenance inspection
+[2026-07-02 14:46:37] ALERT Level 3 (CRITICAL) - Frame ID: test_input.jpg - Max Width: 1.32mm, Length: 89.0mm. Action Required: Immediate shutdown & emergency maintenance inspection
+[2026-07-02 14:48:29] ALERT Level 3 (CRITICAL) - Frame ID: test_input.jpg - Max Width: 1.32mm, Length: 88.8mm. Action Required: Immediate shutdown & emergency maintenance inspection
+[2026-07-02 15:05:44] ALERT LEVEL_3 (Level 3) - Frame ID: test_input.jpg - Track ID: 1 - Width: 0.596mm, Length: 59.3mm - Trigger Reason: Width 0.596mm > 0.5mm - Recommended Action: Immediate shutdown or emergency maintenance

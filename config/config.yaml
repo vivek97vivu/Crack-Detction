@@ -1,0 +1,51 @@
+# Crack Detection Pipeline Configuration
+
+pipeline:
+  px_to_mm: 0.15 # legacy, keep for backwards compatibility if needed
+  alerts_log: "alerts.log"
+  fallback_to_heuristic: true
+  snapshot_dir: "runs/snapshots"
+  save_snapshots: true
+
+gate:
+  checkpoint: null # Set path to pth file if trained, null uses default pre-trained MobileNetV3 weights
+  threshold: 0.2
+  input_size: [224, 224]
+
+detector:
+  checkpoint: "model/checkpoint_best_ema(4).pth"
+  threshold: 0.1
+  input_size: [560, 560]
+  target_classes: ["crack", "rebar", "spall"]
+
+segmenter:
+  checkpoint: null # Set path to pth file if trained
+  input_size: [256, 256]
+  fallback_to_heuristic: true
+
+geometry:
+  pixel_per_mm: 10.0
+  min_length_px: 20
+  min_area_px: 50
+  sample_interval: 5
+  min_eccentricity: 0.6 # legacy
+
+severity:
+  level_1:
+    max_width_mm: 0.2
+    max_length_mm: 20.0
+    action: "Monitor and log during routine checkups"
+    reinspection_days: 180
+  level_2:
+    max_width_mm: 0.5
+    max_length_mm: 50.0
+    action: "Schedule repair/maintenance within 30 days"
+    reinspection_days: 30
+  level_3:
+    action: "Immediate shutdown or emergency maintenance"
+    reinspection_days: 0
+
+alerting: # legacy alerting config
+  cooldowns:
+    2: 7200
+    3: 600

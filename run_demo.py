@@ -4,8 +4,10 @@ import os
 import json
 import time
 
-from myproj.inference.pipeline import CrackDetectionPipeline
-from myproj.utils.alerting import map_severity
+from myproj.inference.pipeline import CrackDetectionPipeline, Detection, detection_to_dict
+from myproj.utils.geometry import extract_geometry, draw_geometry
+from myproj.utils.severity import SeverityLevel
+from myproj.utils.visualization import draw_mask_overlay, draw_severity_badge
 
 def generate_synthetic_image(output_path):
     """
@@ -44,20 +46,9 @@ def main():
     generate_synthetic_image(input_img_path)
     
     # Initialize pipeline
-    # We use checkpoint_best_ema(4).pth for detector.
-    # We set gate_checkpoint=None to initialize a standard MobileNetV3 with pre-trained ImageNet weights.
-    # We set segmenter_checkpoint=None to use the heuristic-based segmenter for the demo.
-    print("\nInitializing Crack Detection Pipeline...")
-    abs_detector_checkpoint = os.path.abspath("checkpoint_best_ema(4).pth")
-    pipeline = CrackDetectionPipeline(
-        detector_checkpoint=abs_detector_checkpoint,
-        gate_checkpoint=None,
-        segmenter_checkpoint=None,
-        gate_threshold=0.2,       # Low gate threshold for demo
-        detector_threshold=0.1,   # Low detector threshold for demo
-        alerts_log="alerts.log",
-        fallback_to_heuristic=True
-    )
+    # Configuration will be loaded automatically from config/config.yaml
+    print("\nInitializing Crack Detection Pipeline using config/config.yaml...")
+    pipeline = CrackDetectionPipeline()
     
     # Run the pipeline on the input image
     print("\nProcessing test image...")
@@ -66,7 +57,7 @@ def main():
     frame_id = "test_input.jpg"
     
     # Process
-    annotated_frame, metadata = pipeline.process_frame(img_bgr, frame_id=frame_id, px_to_mm=0.15)
+    annotated_frame, metadata = pipeline.process_frame(img_bgr, frame_id=frame_id)
     
     # Check if detector found anything on this synthetic image.
     # If not, we simulate a mock detection of a crack to demonstrate the segmenter + geometry + alerting stages.
@@ -77,54 +68,54 @@ def main():
         # Inject mock crack detection box corresponding to our drawn crack
         # Box format: [x1, y1, x2, y2]
         mock_box = [80, 130, 700, 500]
+        x1, y1, x2, y2 = mock_box
         
         # Manually run downstream segmenter on the crop
-        x1, y1, x2, y2 = mock_box
         crop_rgb = cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-        
-        # Segmenter
         mask = pipeline.segmenter.predict(crop_rgb)
         
         # Geometry
-        geom = extract_geometry(mask, px_to_mm=0.15) # 0.15 mm per pixel calibration
-        if geom:
-            geom["bounding_box"][0] += x1
-            geom["bounding_box"][1] += y1
-            
+        geom_list = extract_geometry(
+            mask, 
+            pixel_per_mm=pipeline.px_per_mm, 
+            min_length_px=pipeline.min_length_px,
+            min_area_px=pipeline.min_area_px,
+            sample_interval=pipeline.sample_interval
+        )
+        
+        if geom_list:
             # Severity mapping & Alerting
-            severity = map_severity(geom["max_width_mm"], geom["length_mm"])
+            severity_results = [
+                pipeline.severity_mapper.classify(g.width_mean_mm, g.length_mm)
+                for g in geom_list
+            ]
+            worst_sev = pipeline.severity_mapper.worst_level(severity_results)
             
-            # Trigger alert
-            pipeline.alert_system.trigger_alert(
-                severity_info=severity,
-                frame_id=frame_id,
-                max_width_mm=geom["max_width_mm"],
-                length_mm=geom["length_mm"]
+            det = Detection(
+                bbox_xyxy=np.array(mock_box, dtype=int),
+                class_name="crack",
+                confidence=0.92,
+                class_id=0,
+                track_id=1,
+                geometry=geom_list,
+                severity=worst_sev
             )
             
-            # Draw HUD elements manually on annotated_frame for the output image
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(annotated_frame, f"crack (simulated) 0.92", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+            # Trigger alert and save snapshots
+            pipeline._handle_alert_and_snapshots(det, img_bgr, frame_id)
             
-            mask_bgr = np.zeros_like(img_bgr[y1:y2, x1:x2])
-            mask_bgr[mask > 0] = [0, 0, 255]
-            crop_bgr = annotated_frame[y1:y2, x1:x2]
-            cv2.addWeighted(crop_bgr, 0.7, mask_bgr, 0.3, 0, crop_bgr)
+            # Draw HUD & overlays manually on annotated_frame for the output image
+            annotated_frame = draw_mask_overlay(annotated_frame, mask, det.bbox_xyxy)
+            annotated_frame = draw_severity_badge(annotated_frame, worst_sev, det.bbox_xyxy)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(annotated_frame, f"crack ID:1 0.92", (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             
-            metrics_text = f"W:{geom['max_width_mm']:.2f}mm L:{geom['length_mm']:.1f}mm S:{severity['level']}"
-            cv2.putText(annotated_frame, metrics_text, (x1, y2 + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-            
+            for geom in geom_list:
+                annotated_frame = draw_geometry(annotated_frame, geom, offset_xy=(x1, y1))
+                
             # Update metadata
-            metadata["detections"].append({
-                "box": mock_box,
-                "confidence": 0.92,
-                "class_id": 0,
-                "class_name": "crack",
-                "geometry": geom,
-                "severity": severity
-            })
+            metadata["detections"].append(detection_to_dict(det))
             
     # Save output image
     cv2.imwrite(output_img_path, annotated_frame)

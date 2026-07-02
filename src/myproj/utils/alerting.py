@@ -7,36 +7,71 @@ try:
 except ImportError:
     HAS_MLFLOW = False
 
-def map_severity(max_width_mm, length_mm):
+from myproj.utils.config import load_config
+
+def map_severity(max_width_mm, length_mm, severity_thresholds=None):
     """
     Maps crack width and length to API 570/579 severity levels.
     """
-    if max_width_mm > 0.5 or length_mm > 50.0:
+    if severity_thresholds is None:
+        try:
+            config = load_config()
+            severity_thresholds = config.get("alerting", {}).get("severity_thresholds", {})
+        except Exception:
+            severity_thresholds = {}
+            
+    # Default values in case they are missing in config
+    l3 = severity_thresholds.get("level_3", {"max_width_mm": 0.5, "length_mm": 50.0, "status": "CRITICAL", "recommended_action": "Immediate shutdown & emergency maintenance inspection"})
+    l2 = severity_thresholds.get("level_2", {"max_width_mm": 0.2, "length_mm": 20.0, "status": "MODERATE", "recommended_action": "Schedule repair & maintenance within 30 days"})
+    l1 = severity_thresholds.get("level_1", {"status": "MINOR", "recommended_action": "Routine monitoring and logging during next service cycle"})
+
+    if max_width_mm > l3.get("max_width_mm", 0.5) or length_mm > l3.get("length_mm", 50.0):
         return {
             "level": 3,
-            "status": "CRITICAL",
-            "recommended_action": "Immediate shutdown & emergency maintenance inspection"
+            "status": l3.get("status", "CRITICAL"),
+            "recommended_action": l3.get("recommended_action", "Immediate shutdown & emergency maintenance inspection")
         }
-    elif max_width_mm > 0.2 or length_mm > 20.0:
+    elif max_width_mm > l2.get("max_width_mm", 0.2) or length_mm > l2.get("length_mm", 20.0):
         return {
             "level": 2,
-            "status": "MODERATE",
-            "recommended_action": "Schedule repair & maintenance within 30 days"
+            "status": l2.get("status", "MODERATE"),
+            "recommended_action": l2.get("recommended_action", "Schedule repair & maintenance within 30 days")
         }
     else:
         return {
             "level": 1,
-            "status": "MINOR",
-            "recommended_action": "Routine monitoring and logging during next service cycle"
+            "status": l1.get("status", "MINOR"),
+            "recommended_action": l1.get("recommended_action", "Routine monitoring and logging during next service cycle")
         }
 
 class AlertSystem:
-    def __init__(self, log_path="alerts.log"):
+    def __init__(self, log_path="alerts.log", config=None):
         self.log_path = log_path
-        # Cooldown trackers store the last time an alert was fired for each level
-        # Cooldown intervals in seconds: Level 2 -> 2 hours (7200s), Level 3 -> 10 minutes (600s)
-        self.cooldowns = {2: 7200, 3: 600}
-        self.last_alert_time = {2: 0.0, 3: 0.0}
+        
+        # Load config if not provided
+        if config is None:
+            try:
+                global_config = load_config()
+                config = global_config.get("alerting", {})
+            except Exception:
+                config = {}
+                
+        # Parse cooldowns
+        cooldown_config = config.get("cooldowns", {})
+        self.cooldowns = {}
+        for k, v in cooldown_config.items():
+            try:
+                self.cooldowns[int(k)] = float(v)
+            except ValueError:
+                pass
+                
+        # Provide defaults if empty
+        if not self.cooldowns:
+            self.cooldowns = {2: 7200, 3: 600}
+            
+        self.last_alert_time = {k: 0.0 for k in self.cooldowns.keys()}
+        self.severity_thresholds = config.get("severity_thresholds", None)
+
         
     def log_alert(self, severity_info, frame_id, max_width_mm, length_mm):
         level = severity_info["level"]
