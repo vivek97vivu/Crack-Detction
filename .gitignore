@@ -1,0 +1,40 @@
+# Environments
+venv/
+.env
+
+# Data (tracked via DVC, not git)
+data/raw/*
+data/processed/*
+data/external/public_datasets/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/public_datasets/.gitkeep
+
+# Models (large binaries — track via DVC or MLflow, not git)
+models/checkpoints/*
+models/exported/*
+!models/checkpoints/.gitkeep
+!models/exported/.gitkeep
+
+# Outputs
+outputs/segmentation_results/*
+outputs/severity_reports/*
+outputs/visualizations/*
+!outputs/**/.gitkeep
+
+# MLflow / logs
+mlruns/
+logs/*.log
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+checkpoint_best_ema(4).pth
