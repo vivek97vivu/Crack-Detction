@@ -1,21 +1,21 @@
 <div align="center">
 
-# 🛢️ **Spill & Leak Detection Engine**
+# 🧱 **Crack Detection Pipeline**
 
-### 🚨 Real-Time Oil & Chemical Leak Detection for Industrial CCTV Systems
+### 🚨 Real-Time Structural Defect and Crack Detection for Industrial Infrastructure
 
-A **production-grade AI pipeline** built for **real-time CCTV / RTSP monitoring**, combining **fast YOLO segmentation + custom tracking + interactive Region of Interest (ROI) filtering** for high-precision alerts.
+A **production-grade AI pipeline** built for **real-time structural health monitoring**, combining **MobileNetV3 gating + RF-DETR detection + U-Net segmentation + centerline geometry extraction + tracking** for API 570/579 compliance reporting.
 
-> ⚙️ Powered by **YOLOv8 TensorRT (Segmentation & Tracking)**
-> 🧠 Designed for **low false positives, high reliability deployments**
+> ⚙️ Powered by **MobileNetV3, RF-DETR, and U-Net**
+> 🧠 Designed for **low false positives, high reliability edge deployments**
 > 🧩 Part of the **CampNeuron AI Series** — engineered by the **Algosium AI Team**
 
 ---
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](#)
 [![CUDA](https://img.shields.io/badge/CUDA-12.x-green?logo=nvidia&logoColor=white)](#)
-[![YOLO](https://img.shields.io/badge/YOLO-TensorRT-success?logo=nvidia&logoColor=white)](#)
-[![GStreamer](https://img.shields.io/badge/GStreamer-H264/H265-blue)](#)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange?logo=pytorch&logoColor=white)](#)
+[![API-579](https://img.shields.io/badge/Compliance-API%20570%2F579-red)](#)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20|%20x86__64-lightgrey?logo=linux&logoColor=white)](#)
 
 </div>
@@ -24,7 +24,7 @@ A **production-grade AI pipeline** built for **real-time CCTV / RTSP monitoring*
 
 ## 📷 Visual Demonstrations
 
-Here is a preview of the Spill & Leak Detection Engine in action, showing the detection, instance segmentation, and persistent tracking capabilities on actual industrial streams.
+Here is a preview of the Crack Detection Pipeline in action, showing the detection, instance segmentation, and persistent tracking capabilities on actual concrete and steel structures.
 
 <div align="center">
   <table border="0">
@@ -33,14 +33,14 @@ Here is a preview of the Spill & Leak Detection Engine in action, showing the de
       <td align="center"><b>2. Instance Segmentation Mask</b></td>
     </tr>
     <tr>
-      <td><img src="assets/spill_detection_demo.jpg" alt="RF-DETR Object Detection" width="400"/></td>
-      <td><img src="assets/spill_segmentation_demo.jpg" alt="Spill Instance Segmentation" width="400"/></td>
+      <td><img src="assets/crack_detection_demo.jpg" alt="RF-DETR Object Detection" width="400"/></td>
+      <td><img src="assets/crack_segmentation_demo.jpg" alt="Crack Instance Segmentation" width="400"/></td>
     </tr>
     <tr>
-      <td align="center" colspan="2"><b>3. Real-Time Tracking & ID Assignment (ByteTrack)</b></td>
+      <td align="center" colspan="2"><b>3. Real-Time Tracking & ID Assignment (IOU Tracker)</b></td>
     </tr>
     <tr>
-      <td align="center" colspan="2"><img src="assets/spill_tracking_demo.jpg" alt="ByteTrack Multi-Object Tracking" width="600"/></td>
+      <td align="center" colspan="2"><img src="assets/crack_tracking_demo.jpg" alt="BBox Multi-Object Tracking" width="600"/></td>
     </tr>
   </table>
 </div>
@@ -51,84 +51,98 @@ Here is a preview of the Spill & Leak Detection Engine in action, showing the de
 
 | Component | Purpose |
 |---|---|
-| 🛢️ **YOLOv8 Segmentation** | Real-time leak segmentation and class tracking (`spill`) |
-| 🛡️ **Interactive ROI Manager** | Mouse-click polygon drawing window to isolate detection zones |
-| 🎥 **Threaded RTSP Reader** | Low-latency H264/H265 hardware-accelerated GStreamer & RTSP reader |
-| 🔁 **Unique Track Filtering** | Deduplication to save exactly one screenshot, one JSON report, and one video clip per unique track ID |
-| 📝 **JSON Logger** | Auto-saving structured records of detections, track IDs, and pixel area metrics |
-| ⚙️ **YAML Config Engine** | Centrally managed settings for camera inputs, thresholds, and outputs |
+| 🔍 **MobileNetV3 Binary Gate** | Filters out negative frames (60-80% drop rate) to optimize latency |
+| 🤖 **RF-DETR Detector** | Bounding box localization of target classes (`crack`, `rebar`, `spall`) |
+| 🧩 **U-Net Segmenter** | Pixel-level crack segmentation inside cropped bounding boxes |
+| 📐 **Geometry Extraction** | Centerline skeletonization path traversal to measure width, length, and dominant angle |
+| 🔁 **Unique Track Filtering** | Deduplication to save exactly one crop snapshot and one JSON report per unique track ID |
+| 📝 **API 570/579 Severity** | Maps physical geometry measurements to inspection compliance categories |
+| ⚙️ **YAML Config Engine** | Centrally managed settings in `config/config.yaml` for camera inputs, thresholds, and outputs |
 
 ---
 
 ## 🚀 Pipeline Overview
 
 ```text
-Camera (RTSP Stream / Webcam / Video File / Static Image)
+Camera (RTSP Stream / Webcam / Video File / Static Image / Synthetic)
                           ↓
-        Threaded Frame Reader (RTSPReader)
-                          ↓
-    Interactive ROI Polygon Selection on Startup
-                          ↓
-             YOLO Segmentation Model
-                          ↓
-     Contour Area & ROI Polygon Collision Filtering
-                          ↓
-      Track ID Deduplication (1 Alert per Spill ID)
-                          ↓
-  🚨 ALERT + Save (Annotated Image, Video Clip, JSON Log)
+         MobileNetV3 Binary Gating Classifier
+                          │
+                  (Crack Present?)
+                  /              \
+            (Yes)/                \(No)
+                ▼                  ▼
+       RF-DETR Detector       Drop Frame
+                │
+         (Bounding Box)
+                │
+                ▼
+         U-Net Segmenter
+                │
+             (Mask)
+                │
+                ▼
+      Geometry Extraction (Centerline, Length, Width)
+                │
+                ▼
+      API 570/579 Severity & Alerting (Level 1 / 2 / 3)
+                │
+                ▼
+      Simple BBox Tracker (Assign persistent Track ID)
+                │
+                ▼
+  🚨 ALERT + Save (Cropped JPEG, JSON Log per Track ID)
 ```
 
 ---
 
 ## 🎯 Key Features
 
-* 🛢️ **Real-Time Spill Detection**: Direct integration with YOLOv8 segmentation engines for pixel-level leak localization.
-* 🛡️ **Interactive ROI Selector**: Graphically draw polygon boundaries on startup to filter out irrelevant areas (caching coordinates to `config/roi.yaml`).
-* 🔄 **On-the-Fly ROI Resetting**: Press `R` on the live window to redraw the ROI on the latest frame without restarting the pipeline.
-* ⚡ **GStreamer H264/H265 Support**: Decodes RTSP streams with high efficiency and lower latency.
-* 🔁 **Redundancy Filter**: Prevents alert flooding by saving exactly one screenshot, one JSON report, and one video clip per unique track ID.
-* 🎥 **Custom Track Recording**: Records a track-specific video clip of configurable length (e.g., 5s) showing bounding boxes and masks when a new spill is detected in the ROI, supporting concurrent recordings for multiple spills.
-* 🔌 **Auto-Reconnection**: The RTSP reader automatically reconnects if the camera feed drops.
-* 📂 **Structured JSON Logging**: Saves individual JSON reports and session history tracking timestamps, areas, and confidence metadata for audit trails.
-* 🖥️ **Headless GUI Fallback**: Robustly catches display/GUI exceptions on server environments to reuse previously configured ROIs instead of crashing.
-* 🏷️ **Track ID Annotation**: Displays track IDs (e.g., `Spill #5`) directly on the live overlay and saved screenshots for easy auditing.
+* 🧱 **Real-Time Crack Detection**: Multi-stage deep learning pipeline for localization, segmentation, and classification of structural defects.
+* 🔍 **MobileNetV3 Gating**: Lowers edge hardware execution costs by dynamically filtering out negative frames.
+* 📏 **Connected Component Geometry**: Labels individual crack segments using `skimage` to measure physical length, mean/max width, and orientation.
+* 🔁 **Redundancy Filter**: Prevents alert flooding by saving exactly one crop JPEG and one JSON metadata report per unique track ID.
+* 📝 **Compliance Mapping**: Automatically determines API 570/579 fitness-for-service severity rankings (`LEVEL_1` to `LEVEL_3`) and recommended maintenance intervals.
+* 📂 **Structured JSON Logging**: Saves individual JSON reports and session history logs tracking timestamps, coordinates, geometries, and severity levels.
+* 🏷️ **Track ID Annotation**: Displays track IDs directly on the live overlay and saved screenshots for easy auditing.
 
 ---
 
 ## 📂 Project Structure
 
 ```bash
-spills/
+crack_detection_oilgas/
 ├── config/
-│   ├── config.yaml             # Main configuration file (model, camera, output parameters)
-│   └── roi.yaml                # Cached ROI coordinates
+│   └── config.yaml             # Main configuration file (checkpoints, thresholds, API rules)
 │
-├── models/
-│   └── best.pt                 # YOLO model weights (.pt or TensorRT .engine format)
+├── model/
+│   └── checkpoint_best_ema(4).pth  # RF-DETR model checkpoint
 │
-├── outputs/
-│   ├── images/                 # Confirmed spill screenshots
-│   ├── json/                   # Audit log files
-│   └── videos/                 # Confirmed spill video recordings
+├── runs/
+│   └── snapshots/              # Event-triggered crop images and JSON alert logs
 │
-├── src/
-│   ├── camera/
-│   │   └── rtsp_reader.py      # Threaded frame reader (supporting standard/GStreamer)
-│   ├── detector/
-│   │   └── spill_detector.py   # YOLO model wrapper for segmentation & tracking
-│   ├── roi/
-│   │   └── roi_manager.py      # GUI-based manual ROI selector & geometry filter
-│   ├── visualization/
-│   │   └── draw_results.py     # Renders bbox overlays, masks, and status indicators
-│   ├── output/
-│   │   ├── save_image.py       # Alert screenshot saver (1 per unique ID)
-│   │   ├── save_video.py       # Temporary clip writer for detection events
-│   │   └── save_json.py        # Periodic JSON history logger
+├── src/myproj/
+│   ├── inference/
+│   │   ├── gate.py             # MobileNetV3 gating classifier inference
+│   │   ├── detector.py         # RF-DETR object detector wrapper
+│   │   ├── segmenter.py        # U-Net segmenter wrapper (with morphological fallback)
+│   │   └── pipeline.py         # Coordinates frame gating, tracking, and snapshots
+│   │
+│   ├── training/
+│   │   ├── train_gate.py       # Gate classifier training script
+│   │   └── train_segmenter.py  # U-Net segmenter training script
+│   │
+│   ├── deploy/
+│   │   └── trt_export.py       # Jetson TensorRT ONNX/engine compiler
+│   │
 │   └── utils/
-│       ├── logger.py           # Rotating log configuration
-│       └── helpers.py          # YAML loading helpers
+│       ├── config.py           # YAML config loader and path resolver
+│       ├── geometry.py         # Skeleton centerline path and widths extractor
+│       ├── severity.py         # API 570/579 fitness-for-service mapper
+│       ├── tracking.py         # Simple IOU-based bounding box tracker
+│       └── visualization.py    # Overlays HUD, masks, and severity badges
 │
-├── main.py                     # Main application entry point
+├── run_demo.py                 # Pipeline demonstration entry point
 └── README.md
 ```
 
@@ -139,37 +153,49 @@ spills/
 All system behavior is controlled via `config/config.yaml`. No code changes needed.
 
 ```yaml
-model:
-  weights: "models/best.pt" 
-  device: "cuda"                         
-  imgsz: 640                           
-  conf: 0.45                        
-  iou: 0.45                            
-  classes:
-    0: spill
+pipeline:
+  px_to_mm: 0.15
+  alerts_log: "alerts.log"
+  fallback_to_heuristic: true
+  snapshot_dir: "runs/snapshots"
+  save_snapshots: true
 
-postprocess:
-  min_area_px: 500
+gate:
+  checkpoint: null
+  threshold: 0.2
+  input_size: [224, 224]
 
-visualization:
-  show_preview: true                   
-  preview_scale: 0.75
-  mask_alpha: 0.4
-  colors:
-    oil: [0, 140, 255]
+detector:
+  checkpoint: "model/checkpoint_best_ema(4).pth"
+  threshold: 0.1
+  input_size: [560, 560]
+  target_classes: ["crack", "rebar", "spall"]
 
-camera:
-  mode: "stream"  # "stream" or "image"
-  source: "1.mp4" # RTSP URL, camera index, video file path, or image path
-  fps_limit: 25
-  width: 1280
-  height: 720
+segmenter:
+  checkpoint: null
+  input_size: [256, 256]
+  fallback_to_heuristic: true
 
-output:
-  image_dir: "outputs/images"         
-  video_dir: "outputs/videos"          
-  json_dir: "outputs/json"             
-  video_duration_sec: 5
+geometry:
+  pixel_per_mm: 10.0
+  min_length_px: 20
+  min_area_px: 50
+  sample_interval: 5
+
+severity:
+  level_1:
+    max_width_mm: 0.2
+    max_length_mm: 20.0
+    action: "Monitor and log during routine checkups"
+    reinspection_days: 180
+  level_2:
+    max_width_mm: 0.5
+    max_length_mm: 50.0
+    action: "Schedule repair/maintenance within 30 days"
+    reinspection_days: 30
+  level_3:
+    action: "Immediate shutdown or emergency maintenance"
+    reinspection_days: 0
 ```
 
 ---
@@ -177,11 +203,11 @@ output:
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/vivek97vivu/Spill_detction.git
-cd Spill_detction
+git clone https://github.com/vivek97vivu/Crack-Detction.git
+cd Crack-Detction
 
-# Activate your conda environment (e.g., spill)
-conda activate spill
+# Activate your conda environment (e.g., crack)
+conda activate crack
 
 # Install required dependencies
 pip install -r requirements.txt
@@ -190,8 +216,9 @@ pip install -r requirements.txt
 ### Requirements
 
 * NVIDIA GPU (CUDA support recommended)
-* CUDA 12.x
-* OpenCV with GStreamer support (optional, for low-latency RTSP pipelines)
+* PyTorch / Torchvision
+* scikit-image & scipy
+* OpenCV
 * Python 3.12
 
 ---
@@ -199,31 +226,21 @@ pip install -r requirements.txt
 ## ▶️ Run
 
 ```bash
-python main.py
+# Run with PYTHONPATH pointing to src
+PYTHONPATH=src python run_demo.py
 ```
-
----
-
-## 🎥 Controls
-
-| Key | Action |
-|---|---|
-| `q` / `Q` / `ESC` | Quit the application |
-| `r` / `R` | Reset and redraw the Region of Interest (ROI) on-the-fly |
-| `ENTER` / `SPACE` | Save ROI and start processing (during interactive ROI setup) |
 
 ---
 
 ## 🚨 Alert System
 
-### Stage 1 — Detection & Tracking
-YOLOv8 segmenter detects spills, computes pixel area, and tracks objects across frames.
+### Stage 1 — Detection & Segmentation
+MobileNetV3 filters negative frames. Passing frames are processed by RF-DETR to detect cracks, rebars, or spalls, followed by U-Net crop-level segmentation.
 
-### Stage 2 — ROI Intersection
-If the detected spill polygon intersects with your custom ROI boundary and exceeds `min_area_px`:
-* **Image Alert**: Saves a high-quality annotated JPEG showing the first appearance of the spill to `outputs/images/` (exactly once per track ID, named `spill_track_{track_id}_{timestamp}.jpg`).
-* **Video Alert**: Starts recording a `video_duration_sec` track-specific video clip showing the incident to `outputs/videos/` (exactly once per track ID, named `spill_track_{track_id}_{timestamp}.mp4`).
-* **JSON Log**: Saves an individual JSON report detailing the incident to `outputs/json/` (exactly once per track ID, named `spill_track_{track_id}_{timestamp}.json`).
+### Stage 2 — Geometry & Severity Analysis
+Connected components are extracted, and physical width and length metrics are calculated. If the measurements violate inspection parameters:
+* **Image Alert**: Saves a JPEG crop highlighting the crack area with a 20px margin to `runs/snapshots/` (exactly once per track ID, named `track_{track_id}_crop_{timestamp}.jpg`).
+* **JSON Alert**: Saves a detailed JSON report describing the geometry coordinates, orientation, aspect ratio, and mapped severity action to `runs/snapshots/` (exactly once per track ID, named `track_{track_id}_alert_{timestamp}.json`).
 
 ---
 
@@ -231,9 +248,8 @@ If the detected spill polygon intersects with your custom ROI boundary and excee
 
 | Folder | Contents |
 |---|---|
-| `outputs/images/` | Detection screenshots (saved exactly once per track ID) |
-| `outputs/videos/` | Event-triggered H264 video clips containing overlays and masks |
-| `outputs/json/` | Serialized detection logs containing pixel area, track IDs, and timestamps |
+| `runs/snapshots/` | Track-specific alert reports (.json) and high-quality cropped crack snapshots (.jpg) |
+| `alerts.log` | Central text log appending timestamped severity details and action recommendations |
 
 ---
 
@@ -241,10 +257,10 @@ If the detected spill polygon intersects with your custom ROI boundary and excee
 
 | Metric | Value |
 |---|---|
-| YOLO Segmentation Inference | ~8–15ms (on CUDA GPUs) |
-| Post-processing & ROI Check | ~2–5ms |
-| RTSP Read Latency | Thread-separated, frame-drop policy (0ms block on main loop) |
-| GPU Memory Footprint | ~1.5 GB to 2.5 GB (depending on model size and resolution) |
+| Gating Frame Filter | ~2–4ms |
+| Detector Inference | ~10–18ms (on CUDA GPUs) |
+| Segmentation & Geometry | ~5–12ms |
+| GPU Memory Footprint | ~1.5 GB to 2.2 GB |
 
 ---
 
@@ -252,21 +268,9 @@ If the detected spill polygon intersects with your custom ROI boundary and excee
 
 | Decision | Reason |
 |---|---|
-| **Interactive ROI Selection** | CCTV streams contain static areas (buildings, skies) that never leak; ROI limits false alerts. |
-| **Per-ID Deduplication** | Keeps alert directories clean by avoiding flood-saving the same leak every frame, enforcing exactly one image, one JSON report, and one video clip per spill track ID. |
-| **Threaded RTSP Reader** | Runs frame reading in a background thread to prevent GUI lagging and buffer accumulation. |
-| **JSON Logger** | Keeps a machine-readable audit trail of leaks, track IDs, and pixel areas. |
-| **On-the-Fly ROI Reset** | Allows security operators to adjust monitoring boundaries live without restarting the pipeline. |
-| **Headless GUI Fallback** | Prevents pipeline crashes in remote or automated headless server runs by gracefully catching GUI display errors and reusing loaded config. |
-
----
-
-## 🔮 Future Enhancements
-
-* 📧 Email/Slack notification integration on detection events
-* ☁️ Cloud storage synchronization (AWS S3) for alerts
-* 🌐 Web dashboard for multi-camera visualization
-* 📊 Real-time leakage area growth-rate graph visualization
+| **Binary Classifier Gate** | Gating drops up to 80% of negative frames, saving massive edge hardware compute. |
+| **Deduplicated Alerting** | Enforces saving exactly one crop JPEG and one JSON log per track ID, preventing alert flooding on persistent cracks. |
+| **Scikit-Image Labeling** | Connectivity labeling allows the pipeline to measure and catalog multiple independent cracks inside a single bounding box crop. |
 
 ---
 
