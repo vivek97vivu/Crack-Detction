@@ -38,3 +38,7 @@ __pycache__/
 .idea/
 
 checkpoint_best_ema(4).pth
+
+model
+alerts/json
+alerts/snapshot

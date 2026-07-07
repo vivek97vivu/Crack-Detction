@@ -51,13 +51,14 @@ Here is a preview of the Crack Detection Pipeline in action, showing the detecti
 
 | Component | Purpose |
 |---|---|
-| 🔍 **MobileNetV3 Binary Gate** | Filters out negative frames (60-80% drop rate) to optimize latency |
-| 🤖 **RF-DETR Detector** | Bounding box localization of target classes (`crack`, `rebar`, `spall`) |
+| 🔍 **MobileNetV3 Binary Gate** | Filters out negative frames (60-80% drop rate) to optimize edge latency |
+| 🤖 **RF-DETR Detector** | Bounding box localization of target classes. Silences non-crack detections (`rebar`, `spall`) to focus exclusively on `crack` anomalies |
 | 🧩 **U-Net Segmenter** | Pixel-level crack segmentation inside cropped bounding boxes |
 | 📐 **Geometry Extraction** | Centerline skeletonization path traversal to measure width, length, and dominant angle |
-| 🔁 **Unique Track Filtering** | Deduplication to save exactly one crop snapshot and one JSON report per unique track ID |
-| 📝 **API 570/579 Severity** | Maps physical geometry measurements to inspection compliance categories |
-| ⚙️ **YAML Config Engine** | Centrally managed settings in `config/config.yaml` for camera inputs, thresholds, and outputs |
+| 🔁 **Unique Track Filtering** | Deduplication to save exactly one full-frame annotated JPEG snapshot and one JSON report per unique track ID |
+| 📝 **API 570/579 Severity** | Maps physical geometry measurements (width, length) to inspection compliance categories (`LEVEL_1` to `LEVEL_3`) |
+| 📹 **Multi-Input Streamer** | Ingests USB Webcams, video files, and remote RTSP streams (with GStreamer and automatic FFMPEG fallback) |
+| ⚙️ **YAML Config Engine** | Centrally managed settings in `config/config.yaml` for camera inputs, speed metrics, thresholds, and outputs |
 
 ---
 
@@ -74,7 +75,7 @@ Camera (RTSP Stream / Webcam / Video File / Static Image / Synthetic)
                 ▼                  ▼
        RF-DETR Detector       Drop Frame
                 │
-         (Bounding Box)
+     (Filter: Keep Crack Only)
                 │
                 ▼
          U-Net Segmenter
@@ -91,7 +92,7 @@ Camera (RTSP Stream / Webcam / Video File / Static Image / Synthetic)
       Simple BBox Tracker (Assign persistent Track ID)
                 │
                 ▼
-  🚨 ALERT + Save (Cropped JPEG, JSON Log per Track ID)
+ 🚨 ALERT + Save (Full Annotated Frame, JSON Log per Track ID)
 ```
 
 ---
@@ -113,15 +114,19 @@ Camera (RTSP Stream / Webcam / Video File / Static Image / Synthetic)
 ```bash
 crack_detection_oilgas/
 ├── config/
-│   └── config.yaml             # Main configuration file (checkpoints, thresholds, API rules)
+│   └── config.yaml             # Main configuration file (checkpoints, camera streams, threshold rules)
 │
 ├── model/
-│   └── checkpoint_best_ema(4).pth  # RF-DETR model checkpoint
+│   ├── det.pth                 # RF-DETR model checkpoint (best_ema weights)
+│   └── seg.pth                 # U-Net segmenter model checkpoint
 │
-├── runs/
-│   └── snapshots/              # Event-triggered crop images and JSON alert logs
+├── alerts/
+│   ├── json/                   # Event-triggered structured alert reports (.json)
+│   └── snapshot/               # Event-triggered full annotated snapshot images (.jpg)
 │
-├── src/myproj/
+├── docs/                       # Technical reports and implementation details
+│
+├── src/
 │   ├── inference/
 │   │   ├── gate.py             # MobileNetV3 gating classifier inference
 │   │   ├── detector.py         # RF-DETR object detector wrapper
@@ -142,7 +147,7 @@ crack_detection_oilgas/
 │       ├── tracking.py         # Simple IOU-based bounding box tracker
 │       └── visualization.py    # Overlays HUD, masks, and severity badges
 │
-├── run_demo.py                 # Pipeline demonstration entry point
+├── main.py                     # Entry point (handles synthetic self-test and camera streams)
 └── README.md
 ```
 
@@ -157,8 +162,9 @@ pipeline:
   px_to_mm: 0.15
   alerts_log: "alerts.log"
   fallback_to_heuristic: true
-  snapshot_dir: "runs/snapshots"
   save_snapshots: true
+  alerts_json_dir: "alerts/json"
+  alerts_snapshot_dir: "alerts/snapshot"
 
 gate:
   checkpoint: null
@@ -166,13 +172,13 @@ gate:
   input_size: [224, 224]
 
 detector:
-  checkpoint: "model/checkpoint_best_ema(4).pth"
+  checkpoint: "model/det.pth"
   threshold: 0.1
   input_size: [560, 560]
   target_classes: ["crack", "rebar", "spall"]
 
 segmenter:
-  checkpoint: null
+  checkpoint: "model/seg.pth"
   input_size: [256, 256]
   fallback_to_heuristic: true
 
@@ -182,20 +188,25 @@ geometry:
   min_area_px: 50
   sample_interval: 5
 
-severity:
-  level_1:
-    max_width_mm: 0.2
-    max_length_mm: 20.0
-    action: "Monitor and log during routine checkups"
-    reinspection_days: 180
-  level_2:
-    max_width_mm: 0.5
-    max_length_mm: 50.0
-    action: "Schedule repair/maintenance within 30 days"
-    reinspection_days: 30
-  level_3:
-    action: "Immediate shutdown or emergency maintenance"
-    reinspection_days: 0
+alerting: # legacy alerting config
+  cooldowns:
+    2: 7200
+    3: 600
+
+cameras:
+  - id: cam_1
+    source: 0
+    name: "Brio Webcam"
+    enabled: false
+    use_gstreamer: false
+
+  - id: cam_video
+    source: "/home/vivek/Downloads/istockphoto-2156919688-640_adpp_is.mp4"
+    name: "Video Test"
+    enabled: true
+    use_gstreamer: false
+    playback_fps: 25.0
+    frame_skip: 5  # Process every 5th frame to run faster (playback speedup)
 ```
 
 ---
@@ -225,52 +236,44 @@ pip install -r requirements.txt
 
 ## ▶️ Run
 
+You can run the pipeline directly without specifying environment variables. The entrypoint script dynamically adds project directories to the path:
+
 ```bash
-# Run with PYTHONPATH pointing to src
-PYTHONPATH=src python run_demo.py
+python main.py
 ```
+
+* **Note**: If any camera is `enabled: true` in your `config.yaml`, the pipeline immediately boots the live stream. If all cameras are disabled, it falls back to a synthetic self-test run generating `test_input.jpg` and `test_output.jpg`.
 
 ---
 
 ## 🚨 Alert System
 
-### Stage 1 — Detection & Segmentation
-MobileNetV3 filters negative frames. Passing frames are processed by RF-DETR to detect cracks, rebars, or spalls, followed by U-Net crop-level segmentation.
+### Stage 1 — Gating & Crack Filtering
+MobileNetV3 filters negative frames. Passing frames are processed by RF-DETR. Any detections that are not class `"crack"` (such as rebar or spall) are discarded immediately to keep the system silent on non-crack anomalies.
 
-### Stage 2 — Geometry & Severity Analysis
-Connected components are extracted, and physical width and length metrics are calculated. If the measurements violate inspection parameters:
-* **Image Alert**: Saves a JPEG crop highlighting the crack area with a 20px margin to `runs/snapshots/` (exactly once per track ID, named `track_{track_id}_crop_{timestamp}.jpg`).
-* **JSON Alert**: Saves a detailed JSON report describing the geometry coordinates, orientation, aspect ratio, and mapped severity action to `runs/snapshots/` (exactly once per track ID, named `track_{track_id}_alert_{timestamp}.json`).
+### Stage 2 — Measurement & Severity Analysis
+For each unique `track_id`, physical width and length metrics are calculated. If the measurements exceed severity thresholds:
+* **Image Alert**: Saves the **full annotated frame** highlighting the crack path, bounding box, track ID, and severity badge to `alerts/snapshot/track_{track_id}.jpg`.
+* **JSON Alert**: Saves a detailed JSON metadata log detailing the crack location, length, orientation, and severity action recommendation to `alerts/json/track_{track_id}.json`.
 
 ---
 
 ## 📸 Output
 
-| Folder | Contents |
+| Directory / File | Contents |
 |---|---|
-| `runs/snapshots/` | Track-specific alert reports (.json) and high-quality cropped crack snapshots (.jpg) |
+| `alerts/snapshot/` | Full-frame annotated snapshots (.jpg) showing marked crack paths |
+| `alerts/json/` | Track-specific alert data reports (.json) containing exact geometry and severity levels |
 | `alerts.log` | Central text log appending timestamped severity details and action recommendations |
 
 ---
 
-## ⚡ Performance
+## 🧪 Key Engineering Decisions
 
-| Metric | Value |
-|---|---|
-| Gating Frame Filter | ~2–4ms |
-| Detector Inference | ~10–18ms (on CUDA GPUs) |
-| Segmentation & Geometry | ~5–12ms |
-| GPU Memory Footprint | ~1.5 GB to 2.2 GB |
-
----
-
-## 🧪 Engineering Decisions
-
-| Decision | Reason |
-|---|---|
-| **Binary Classifier Gate** | Gating drops up to 80% of negative frames, saving massive edge hardware compute. |
-| **Deduplicated Alerting** | Enforces saving exactly one crop JPEG and one JSON log per track ID, preventing alert flooding on persistent cracks. |
-| **Scikit-Image Labeling** | Connectivity labeling allows the pipeline to measure and catalog multiple independent cracks inside a single bounding box crop. |
+* **FFMPEG RTSP Fallback**: Protects production environments by automatically switching from GStreamer pipelines to direct OpenCV FFMPEG readers if local network or plugin issues occur.
+* **Warning Suppression**: Blocks package deprecation output to keep terminal streams clean and readable.
+* **Frame Skipping (`frame_skip`)**: Processes every $N$-th frame (e.g., 1 out of 5 frames), reducing CPU/GPU load to guarantee real-time performance on high-resolution video streams.
+* **Deduplicated Alerting**: Prevents alert flooding by logging exactly one snapshot and JSON report per unique track ID.
 
 ---
 
