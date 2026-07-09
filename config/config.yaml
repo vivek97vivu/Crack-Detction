@@ -7,15 +7,16 @@ pipeline:
   save_snapshots: true
   alerts_json_dir: "alerts/json"
   alerts_snapshot_dir: "alerts/snapshot"
+  min_consecutive_frames: 4
 
 gate:
   checkpoint: null # Set path to pth file if trained, null uses default pre-trained MobileNetV3 weights
-  threshold: 0.2
+  threshold: 0.5
   input_size: [224, 224]
 
 detector:
-  checkpoint: "model/det.pth"
-  threshold: 0.1
+  checkpoint: "model/seg.pth"
+  threshold: 0.45
   input_size: [560, 560]
   target_classes: ["crack", "rebar", "spall"]
 
@@ -43,7 +44,7 @@ severity:
     action: "Schedule repair/maintenance within 30 days"
     reinspection_days: 30
   level_3:
-    action: "Immediate shutdown or emergency maintenance"
+    action: "emergency maintenance"
     reinspection_days: 0
 
 alerting: # legacy alerting config
@@ -53,29 +54,29 @@ alerting: # legacy alerting config
 
 cameras:
   # - id: cam_1
-  #   source: 0
+  #   source: 4
   #   name: "Brio Webcam"
   #   enabled: true
   #   use_gstreamer: false
 
-  # - id: cam_2
-  #   source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-  #   name: "LOREX"
-  #   enabled: true
-  #   use_gstreamer: true
-  #   codec: "h265"
-  #   protocols: "tcp"
-  #   latency: 0
-  #   drop_on_latency: true
-  #   playback_fps: 0
-
-  - id: cam_video
-    source: "/home/vivek/Downloads/istockphoto-2233134282-640_adpp_is.mp4"
-    name: "Video Test"
+  - id: cam_2
+    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
+    name: "LOREX"
     enabled: true
-    use_gstreamer: false
-    playback_fps: 25.0 
-    frame_skip: 1 # Process every Nth frame to speed up playback/processing
+    use_gstreamer: true
+    codec: "h265"
+    protocols: "tcp"
+    latency: 0
+    drop_on_latency: true
+    playback_fps: 0
+
+  # - id: cam_video
+  #   source: "/home/vivek/Downloads/istockphoto-2233134282-640_adpp_is.mp4"
+  #   name: "Video Test"
+  #   enabled: true
+  #   use_gstreamer: false
+  #   playback_fps: 25.0 
+  #   frame_skip: 5 # Process every Nth frame to speed up playback/processing
 
   # - id: cam_image
   #   source: "/home/vivek/Downloads/imagy-split-image-2026-05-18/ChatGPT Image May 18, 2026, 12_44_27 PM_r4_c5.png"    # path to your image

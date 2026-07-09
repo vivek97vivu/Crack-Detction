@@ -136,6 +136,14 @@ class CrackDetectionPipeline:
         self.alerts_log = alerts_log if alerts_log is not None else p_cfg.get("alerts_log", "alerts.log")
         self.save_snapshots = p_cfg.get("save_snapshots", True)
         self.alerted_track_ids = set()
+        
+        # Load minimum consecutive frames configuration (default to 1)
+        self.min_consecutive_frames = p_cfg.get("min_consecutive_frames", 1)
+        self.track_frame_counts = {}
+        
+        # Generate a unique run timestamp prefix for the output filenames
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
         self.alerts_json_dir = resolve_path(p_cfg.get("alerts_json_dir", "alerts/json"))
         self.alerts_snapshot_dir = resolve_path(p_cfg.get("alerts_snapshot_dir", "alerts/snapshot"))
 
@@ -191,6 +199,17 @@ class CrackDetectionPipeline:
             
         # Update tracker
         detections = self.tracker.update(raw_detections)
+        
+        # Update track frame counts
+        for det in detections:
+            if det.track_id is not None:
+                self.track_frame_counts[det.track_id] = self.track_frame_counts.get(det.track_id, 0) + 1
+                
+        # Clean up inactive track counts to save memory
+        active_track_ids = set(self.tracker.tracked_dets.keys())
+        self.track_frame_counts = {
+            tid: count for tid, count in self.track_frame_counts.items() if tid in active_track_ids
+        }
         
         # Count variables
         n_detections = len(detections)
@@ -258,6 +277,11 @@ class CrackDetectionPipeline:
             
         track_id = det.track_id
         if track_id is not None:
+            # If not tracked via process_frame, default to the threshold to allow immediate triggering
+            frame_count = self.track_frame_counts.get(track_id, self.min_consecutive_frames)
+            if frame_count < self.min_consecutive_frames:
+                return
+                
             if track_id in self.alerted_track_ids:
                 return
             self.alerted_track_ids.add(track_id)
@@ -291,7 +315,7 @@ class CrackDetectionPipeline:
             os.makedirs(self.alerts_snapshot_dir, exist_ok=True)
             
             # JSON file snapshot
-            json_filename = f"track_{track_id}.json"
+            json_filename = f"{self.run_timestamp}_track_{track_id}.json"
             json_path = os.path.join(self.alerts_json_dir, json_filename)
             
             snapshot_data = {
@@ -308,7 +332,7 @@ class CrackDetectionPipeline:
                 print(f"Error saving alert JSON: {e}")
                 
             # JPEG Image snapshot (save full frame with marked detections)
-            crop_filename = f"track_{track_id}.jpg"
+            crop_filename = f"{self.run_timestamp}_track_{track_id}.jpg"
             crop_path = os.path.join(self.alerts_snapshot_dir, crop_filename)
             
             try:

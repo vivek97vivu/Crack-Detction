@@ -113,6 +113,12 @@ def main():
         if frame_skip > 1:
             print(f"Frame skip enabled: processing 1 frame every {frame_skip} frames to accelerate playback.")
             
+        # Get playback FPS to control display speed (0 or unset means no artificial delay)
+        playback_fps = camera_cfg.get("playback_fps", 0)
+        delay_ms = max(1, int(1000 / playback_fps)) if playback_fps > 0 else 1
+        if playback_fps > 0:
+            print(f"Target playback speed: {playback_fps} FPS (Frame delay: {delay_ms}ms)")
+            
         frame_count = 0
         try:
             while True:
@@ -133,7 +139,7 @@ def main():
                 # Try to show the live feed if GUI backend is available
                 try:
                     cv2.imshow(f"Crack Detection Live - {cam_name}", annotated)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    if cv2.waitKey(delay_ms) & 0xFF == ord('q'):
                         break
                 except Exception:
                     # Headless mode fallback: print progress periodically
