@@ -124,6 +124,9 @@ crack_detection_oilgas/
 │   ├── json/                   # Event-triggered structured alert reports (.json)
 │   └── snapshot/               # Event-triggered full annotated snapshot images (.jpg)
 │
+├── log/
+│   └── alerts.log              # Appended event logs
+│
 ├── docs/                       # Technical reports and implementation details
 │
 ├── src/
@@ -160,11 +163,12 @@ All system behavior is controlled via `config/config.yaml`. No code changes need
 ```yaml
 pipeline:
   px_to_mm: 0.15
-  alerts_log: "alerts.log"
+  alerts_log: "log/alerts.log"
   fallback_to_heuristic: true
   save_snapshots: true
   alerts_json_dir: "alerts/json"
   alerts_snapshot_dir: "alerts/snapshot"
+  min_consecutive_frames: 4
 
 gate:
   checkpoint: null

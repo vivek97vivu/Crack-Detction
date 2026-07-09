@@ -232,9 +232,9 @@ def main():
         print("\n--- Pipeline Execution Metadata ---")
         print(json.dumps(metadata, indent=2))
         
-        print("\n--- Severity Alerting Log (alerts.log) ---")
-        if os.path.exists("alerts.log"):
-            with open("alerts.log", "r") as f:
+        print(f"\n--- Severity Alerting Log ({pipeline.alerts_log}) ---")
+        if os.path.exists(pipeline.alerts_log):
+            with open(pipeline.alerts_log, "r") as f:
                 print(f.read())
             
 if __name__ == "__main__":

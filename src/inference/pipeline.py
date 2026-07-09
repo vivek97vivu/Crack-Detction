@@ -133,7 +133,7 @@ class CrackDetectionPipeline:
         self.min_area_px = geom_cfg.get("min_area_px", 50)
         self.sample_interval = geom_cfg.get("sample_interval", 5)
         
-        self.alerts_log = alerts_log if alerts_log is not None else p_cfg.get("alerts_log", "alerts.log")
+        self.alerts_log = resolve_path(alerts_log if alerts_log is not None else p_cfg.get("alerts_log", "log/alerts.log"))
         self.save_snapshots = p_cfg.get("save_snapshots", True)
         self.alerted_track_ids = set()
         
@@ -304,6 +304,9 @@ class CrackDetectionPipeline:
         
         # Append log
         try:
+            log_dir = os.path.dirname(self.alerts_log)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
             with open(self.alerts_log, "a") as f:
                 f.write(log_line)
         except Exception as e:
