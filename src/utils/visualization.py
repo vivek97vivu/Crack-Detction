@@ -3,6 +3,7 @@ utils/visualization.py — Drawing helpers for crack detection pipeline.
 """
 import cv2
 import numpy as np
+from typing import Optional
 
 SEVERITY_COLORS = {
     1: (0, 255, 255),   # Level 1 — yellow
@@ -63,14 +64,16 @@ def draw_severity_badge(frame: np.ndarray, severity_result,
     return out
 
 
-def draw_pipeline_hud(frame: np.ndarray, gate_prob: float,
+def draw_pipeline_hud(frame: np.ndarray, gate_prob: Optional[float],
                        n_detections: int, n_cracks: int) -> np.ndarray:
     out = frame.copy()
-    lines = [
-        f"Gate P(crack): {gate_prob:.3f}",
+    lines = []
+    if gate_prob is not None:
+        lines.append(f"Gate P(crack): {gate_prob:.3f}")
+    lines.extend([
         f"Detections   : {n_detections}",
         f"Cracks       : {n_cracks}",
-    ]
+    ])
     for i, line in enumerate(lines):
         cv2.putText(out, line, (8, 20 + i * 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)

@@ -44,3 +44,5 @@ alerts.log
 model
 alerts/json
 alerts/snapshot
+test_input.jpg
+test_output.jpg

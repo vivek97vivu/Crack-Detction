@@ -7,25 +7,14 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
-from inference.gate import GateInference
-from inference.detector import DetectorInference
+from inference.detector import DetectorInference, Detection
 from inference.segmenter import SegmenterInference
-from utils.geometry import extract_geometry, CrackGeometry, draw_geometry
+from inference.gate import GateInference
+from utils.geometry import CrackGeometry, draw_geometry
 from utils.severity import APISeverityMapper, SeverityResult, SeverityLevel
 from utils.visualization import draw_detections, draw_mask_overlay, draw_severity_badge, draw_pipeline_hud
 from utils.tracking import SimpleBBoxTracker
 from utils.config import load_config, resolve_path
-
-@dataclass
-class Detection:
-    bbox_xyxy: np.ndarray # shape (4,) [x1, y1, x2, y2]
-    class_name: str
-    confidence: float
-    class_id: int
-    track_id: Optional[int] = None
-    geometry: List[CrackGeometry] = None
-    severity: Optional[SeverityResult] = None
-    mask: Optional[np.ndarray] = None
 
 def detection_to_dict(det: Detection):
     geom_list = []
@@ -68,9 +57,9 @@ def detection_to_dict(det: Detection):
 class CrackDetectionPipeline:
     def __init__(self, 
                  detector_checkpoint=None, 
-                 gate_checkpoint=None, 
+                 gate_checkpoint=None,
                  segmenter_checkpoint=None,
-                 gate_threshold=None, 
+                 gate_threshold=None,
                  detector_threshold=None,
                  alerts_log=None,
                  fallback_to_heuristic=None,
@@ -81,13 +70,17 @@ class CrackDetectionPipeline:
         self.config = config
         
         p_cfg = config.get("pipeline", {})
+        self.enable_gate = p_cfg.get("enable_gate", True)
         g_cfg = config.get("gate", {})
         d_cfg = config.get("detector", {})
         s_cfg = config.get("segmenter", {})
         geom_cfg = config.get("geometry", {})
         
         # Resolve detector checkpoint
-        det_checkpoint = detector_checkpoint if detector_checkpoint is not None else d_cfg.get("checkpoint", "checkpoint_best_ema(4).pth")
+        det_checkpoint = (
+            detector_checkpoint if detector_checkpoint is not None 
+            else (d_cfg.get("checkpoint") or d_cfg.get("checkpoint_ema") or "checkpoint_best_ema(4).pth")
+        )
         det_checkpoint = resolve_path(det_checkpoint)
         det_threshold = detector_threshold if detector_threshold is not None else d_cfg.get("threshold", 0.3)
         
@@ -102,10 +95,13 @@ class CrackDetectionPipeline:
         fallback = fallback_to_heuristic if fallback_to_heuristic is not None else s_cfg.get("fallback_to_heuristic", True)
         
         # 1. Gate Stage
-        self.gate = GateInference(
-            checkpoint_path=g_checkpoint, 
-            threshold=g_threshold
-        )
+        if self.enable_gate:
+            self.gate = GateInference(
+                checkpoint_path=g_checkpoint, 
+                threshold=g_threshold
+            )
+        else:
+            self.gate = None
         
         # 2. Detector Stage
         self.detector = DetectorInference(
@@ -141,6 +137,13 @@ class CrackDetectionPipeline:
         self.min_consecutive_frames = p_cfg.get("min_consecutive_frames", 1)
         self.track_frame_counts = {}
         
+        # Load force split segmentation option (default to False)
+        self.force_split_segmentation = p_cfg.get("force_split_segmentation", False)
+        
+        # Load stage enabled/disabled flags (default to True)
+        self.enable_detection = p_cfg.get("enable_detection", True)
+        self.enable_segmentation = p_cfg.get("enable_segmentation", True)
+        
         # Generate a unique run timestamp prefix for the output filenames
         self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -148,6 +151,9 @@ class CrackDetectionPipeline:
         self.alerts_snapshot_dir = resolve_path(p_cfg.get("alerts_snapshot_dir", "alerts/snapshot"))
 
     def process_frame(self, frame_bgr, frame_id, pixel_per_mm=None):
+        if len(frame_bgr.shape) == 2:
+            frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
+            
         if pixel_per_mm is None:
             pixel_per_mm = self.px_per_mm
             
@@ -165,7 +171,11 @@ class CrackDetectionPipeline:
         start_time = time.time()
         
         # --- Stage 1: Gate ---
-        gate_passed, prob = self.gate.predict(frame_rgb)
+        if self.enable_gate and self.gate is not None:
+            gate_passed, prob = self.gate.predict(frame_rgb)
+        else:
+            gate_passed, prob = True, 1.0
+            
         metadata["gate_passed"] = bool(gate_passed)
         metadata["gate_probability"] = float(prob)
         
@@ -175,99 +185,110 @@ class CrackDetectionPipeline:
             annotated_frame = draw_pipeline_hud(annotated_frame, prob, 0, 0)
             metadata["processing_time_ms"] = float((time.time() - start_time) * 1000)
             return annotated_frame, metadata
+        
+        # --- Stage 2 & 3 Dynamic Paths ---
+        if self.enable_detection:
+            # Stage 2: Detector and tracker (handled inside detector.py)
+            detections = self.detector.process(frame_rgb, self.tracker)
             
-        # --- Stage 2: Detector ---
-        detector_outputs = self.detector.predict(frame_rgb)
-        
-        # Map to Detection objects
-        raw_detections = []
-        for det in detector_outputs:
-            if det["class_name"] != "crack":
-                continue
-            box = det["box"]
-            x1, y1, x2, y2 = map(int, box)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
+            # Update track frame counts
+            for det in detections:
+                if det.track_id is not None:
+                    self.track_frame_counts[det.track_id] = self.track_frame_counts.get(det.track_id, 0) + 1
+                    
+            # Clean up inactive track counts to save memory
+            active_track_ids = set(self.tracker.tracked_dets.keys())
+            self.track_frame_counts = {
+                tid: count for tid, count in self.track_frame_counts.items() if tid in active_track_ids
+            }
             
-            raw_detections.append(Detection(
-                bbox_xyxy=np.array([x1, y1, x2, y2], dtype=int),
-                class_name=det["class_name"],
-                confidence=det["confidence"],
-                class_id=det["class_id"],
-                mask=det.get("mask")
-            ))
+            # Count variables
+            n_detections = len(detections)
+            n_cracks = sum(1 for d in detections if d.class_name == "crack")
             
-        # Update tracker
-        detections = self.tracker.update(raw_detections)
-        
-        # Update track frame counts
-        for det in detections:
-            if det.track_id is not None:
-                self.track_frame_counts[det.track_id] = self.track_frame_counts.get(det.track_id, 0) + 1
-                
-        # Clean up inactive track counts to save memory
-        active_track_ids = set(self.tracker.tracked_dets.keys())
-        self.track_frame_counts = {
-            tid: count for tid, count in self.track_frame_counts.items() if tid in active_track_ids
-        }
-        
-        # Count variables
-        n_detections = len(detections)
-        n_cracks = sum(1 for d in detections if d.class_name == "crack")
-        
-        # Draw bounding boxes and HUD
-        annotated_frame = draw_detections(annotated_frame, detections)
-        annotated_frame = draw_pipeline_hud(annotated_frame, prob, n_detections, n_cracks)
-        
-        # Process each detection
-        for det in detections:
-            x1, y1, x2, y2 = det.bbox_xyxy
+            # Draw bounding boxes and HUD
+            annotated_frame = draw_detections(annotated_frame, detections)
+            annotated_frame = draw_pipeline_hud(annotated_frame, prob if self.enable_gate else None, n_detections, n_cracks)
             
-            # --- Stage 3: Segmentation (only for cracks) ---
-            if det.class_name == "crack" and (x2 > x1) and (y2 > y1):
-                crop = frame_rgb[y1:y2, x1:x2]
-                if det.mask is not None:
-                    full_mask_uint8 = det.mask.astype(np.uint8) * 255
-                    mask = full_mask_uint8[y1:y2, x1:x2]
-                else:
-                    mask = self.segmenter.predict(crop)
-                
-                # --- Stage 4: Geometry ---
-                geom_list = extract_geometry(
-                    mask, 
-                    pixel_per_mm=pixel_per_mm,
-                    min_length_px=self.min_length_px,
-                    min_area_px=self.min_area_px,
-                    sample_interval=self.sample_interval
-                )
-                
-                if geom_list:
-                    det.geometry = geom_list
+            # Process each detection for segmentation if enabled
+            for det in detections:
+                if self.enable_segmentation:
+                    x1, y1, x2, y2 = det.bbox_xyxy
                     
-                    # Compute severity based on the worst severity result of all crack instances in this crop
-                    severity_results = [
-                        self.severity_mapper.classify(g.width_mean_mm, g.length_mm)
-                        for g in geom_list
-                    ]
-                    worst_sev = self.severity_mapper.worst_level(severity_results)
-                    det.severity = worst_sev
-                    
-                    # Draw mask overlay
-                    annotated_frame = draw_mask_overlay(annotated_frame, mask, det.bbox_xyxy)
-                    
-                    # Draw severity badge
-                    annotated_frame = draw_severity_badge(annotated_frame, worst_sev, det.bbox_xyxy)
-                    
-                    # Draw centerline skeleton and width/length labels
-                    for geom in geom_list:
-                        # Draw geometry relative to bounding box offset
-                        annotated_frame = draw_geometry(annotated_frame, geom, offset_xy=(x1, y1))
+                    # --- Stage 3: Segmentation (only for cracks) ---
+                    if det.class_name == "crack" and (x2 > x1) and (y2 > y1):
+                        # Determine if we should use detector's mask or UNet segmenter
+                        if det.mask is not None and not self.force_split_segmentation:
+                            mask = det.mask.astype(np.uint8) * 255
+                            mask = mask[y1:y2, x1:x2]
+                            # Run geometry and severity mapping on the mask (handled inside segmenter.py)
+                            geom_list, worst_sev = self.segmenter.process_mask(
+                                mask, pixel_per_mm, self.min_length_px, self.min_area_px, self.sample_interval, self.severity_mapper
+                            )
+                        else:
+                            crop = frame_rgb[y1:y2, x1:x2]
+                            # Run crop segmentation, geometry, and severity mapping (handled inside segmenter.py)
+                            mask, geom_list, worst_sev = self.segmenter.process_crop(
+                                crop, pixel_per_mm, self.min_length_px, self.min_area_px, self.sample_interval, self.severity_mapper
+                            )
                         
-                    # Save snapshot and trigger alerts
-                    self._handle_alert_and_snapshots(det, annotated_frame, frame_id)
-                    
-            metadata["detections"].append(detection_to_dict(det))
+                        if geom_list:
+                            det.geometry = geom_list
+                            det.severity = worst_sev
+                            
+                            # Draw mask overlay
+                            annotated_frame = draw_mask_overlay(annotated_frame, mask, det.bbox_xyxy)
+                            
+                            # Draw severity badge
+                            annotated_frame = draw_severity_badge(annotated_frame, worst_sev, det.bbox_xyxy)
+                            
+                            # Draw centerline skeleton and width/length labels
+                            for geom in geom_list:
+                                # Draw geometry relative to bounding box offset
+                                annotated_frame = draw_geometry(annotated_frame, geom, offset_xy=(x1, y1))
+                                
+                            # Save snapshot and trigger alerts
+                            self._handle_alert_and_snapshots(det, annotated_frame, frame_id)
+                            
+                metadata["detections"].append(detection_to_dict(det))
+                
+        elif self.enable_segmentation:
+            # --- Segmentation-only Mode: run directly on the full frame (handled inside segmenter.py) ---
+            mask, geom_list, worst_sev = self.segmenter.process_crop(
+                frame_rgb, pixel_per_mm, self.min_length_px, self.min_area_px, self.sample_interval, self.severity_mapper
+            )
             
+            annotated_frame = draw_pipeline_hud(annotated_frame, prob if self.enable_gate else None, 0, 1 if geom_list else 0)
+            
+            if geom_list:
+                # Draw mask overlay on full frame
+                annotated_frame = draw_mask_overlay(annotated_frame, mask, np.array([0, 0, w, h], dtype=int))
+                
+                # Draw severity badge (fixed location at top-left)
+                annotated_frame = draw_severity_badge(annotated_frame, worst_sev, np.array([10, 50, 150, 100], dtype=int))
+                
+                # Draw centerline and labels
+                for geom in geom_list:
+                    annotated_frame = draw_geometry(annotated_frame, geom, offset_xy=(0, 0))
+                    
+                # Create a dummy detection object for logging / alerting in segmentation-only mode
+                dummy_det = Detection(
+                    bbox_xyxy=np.array([0, 0, w, h], dtype=int),
+                    class_name="crack",
+                    confidence=1.0,
+                    class_id=0,
+                    track_id=None
+                )
+                dummy_det.severity = worst_sev
+                dummy_det.geometry = geom_list
+                
+                # Save snapshot and trigger alerts
+                self._handle_alert_and_snapshots(dummy_det, annotated_frame, frame_id)
+                metadata["detections"].append(detection_to_dict(dummy_det))
+        else:
+            # Both disabled (video passthrough)
+            annotated_frame = draw_pipeline_hud(annotated_frame, prob if self.enable_gate else None, 0, 0)
+
         metadata["processing_time_ms"] = float((time.time() - start_time) * 1000)
         return annotated_frame, metadata
 
@@ -313,12 +334,19 @@ class CrackDetectionPipeline:
             print(f"Error writing to alerts log: {e}")
             
         # Snapshot saving
-        if self.save_snapshots and track_id is not None:
+        if self.save_snapshots:
             os.makedirs(self.alerts_json_dir, exist_ok=True)
             os.makedirs(self.alerts_snapshot_dir, exist_ok=True)
             
+            # Form clean filename prefix
+            if track_id is not None:
+                file_prefix = f"{self.run_timestamp}_track_{track_id}"
+            else:
+                frame_id_clean = os.path.basename(str(frame_id)).replace(".", "_").replace("/", "_").replace("\\", "_")
+                file_prefix = f"{self.run_timestamp}_frame_{frame_id_clean}"
+            
             # JSON file snapshot
-            json_filename = f"{self.run_timestamp}_track_{track_id}.json"
+            json_filename = f"{file_prefix}.json"
             json_path = os.path.join(self.alerts_json_dir, json_filename)
             
             snapshot_data = {
@@ -335,7 +363,7 @@ class CrackDetectionPipeline:
                 print(f"Error saving alert JSON: {e}")
                 
             # JPEG Image snapshot (save full frame with marked detections)
-            crop_filename = f"{self.run_timestamp}_track_{track_id}.jpg"
+            crop_filename = f"{file_prefix}.jpg"
             crop_path = os.path.join(self.alerts_snapshot_dir, crop_filename)
             
             try:

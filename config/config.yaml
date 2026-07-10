@@ -8,21 +8,24 @@ pipeline:
   alerts_json_dir: "alerts/json"
   alerts_snapshot_dir: "alerts/snapshot"
   min_consecutive_frames: 4
+  force_split_segmentation: false # If true, forces the pipeline to run the separate U-Net segmenter instead of using the detector's masks
+  enable_detection: true
+  enable_segmentation: true 
+  enable_gate: true
 
 gate:
-  checkpoint: null # Set path to pth file if trained, null uses default pre-trained MobileNetV3 weights
+  checkpoint: null
   threshold: 0.5
   input_size: [224, 224]
 
 detector:
-  # checkpoint: "model/seg.pth"
-  checkpoint_ema: "output/rfdetr-seg-medium.onnx"
+  checkpoint_ema: "model/seg.pth"
   threshold: 0.45
   input_size: [560, 560]
   target_classes: ["crack", "rebar", "spall"]
 
 segmenter:
-  checkpoint: null # Set path to pth file if trained
+  checkpoint: null 
   input_size: [256, 256]
   fallback_to_heuristic: true
 
@@ -55,31 +58,31 @@ alerting: # legacy alerting config
 
 cameras:
   # - id: cam_1
-  #   source: 4
+  #   source: 2
   #   name: "Brio Webcam"
   #   enabled: true
   #   use_gstreamer: false
 
-  # - id: cam_2
-  #   source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-  #   name: "LOREX"
-  #   enabled: true
-  #   use_gstreamer: true
-  #   codec: "h265"
-  #   protocols: "tcp"
-  #   latency: 0
-  #   drop_on_latency: true
-  #   playback_fps: 0
-
-  - id: cam_video
-    source: "/home/vivek/Downloads/vecteezy_construction-engineer-photographing-cracked-wall_75011916.mp4"
-    name: "Video Test"
+  - id: cam_2
+    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
+    name: "LOREX"
     enabled: true
-    use_gstreamer: false
-    playback_fps: 25.0 
-    frame_skip: 5 # Process every Nth frame to speed up playback/processing
+    use_gstreamer: true
+    codec: "h265"
+    protocols: "tcp"
+    latency: 0
+    drop_on_latency: true
+    playback_fps: 0
+
+  # - id: cam_video
+  #   source: "/home/vivek/Downloads/vecteezy_construction-engineer-photographing-cracked-wall_75011916.mp4"
+  #   name: "Video Test"
+  #   enabled: true
+  #   use_gstreamer: false
+  #   playback_fps: 25.0 
+  #   frame_skip: 5 # Process every Nth frame to speed up playback/processing
 
   # - id: cam_image
-  #   source: "/home/vivek/Downloads/imagy-split-image-2026-05-18/ChatGPT Image May 18, 2026, 12_44_27 PM_r4_c5.png"    # path to your image
+  #   source: "/home/vivek/Downloads/imagy-split-image-2026-05-18/ChatGPT Image May 18, 2026, 12_44_27 PM_r4_c5.png"    
   #   name: "Image Test"
   #   playback_fps: 1.0

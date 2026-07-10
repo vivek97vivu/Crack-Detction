@@ -67,32 +67,32 @@ Here is a preview of the Crack Detection Pipeline in action, showing the detecti
 ```text
 Camera (RTSP Stream / Webcam / Video File / Static Image / Synthetic)
                           ↓
-         MobileNetV3 Binary Gating Classifier
+         MobileNetV3 Binary Gating Classifier (Optional)
                           │
-                  (Crack Present?)
-                  /              \
-            (Yes)/                \(No)
-                ▼                  ▼
-       RF-DETR Detector       Drop Frame
-                │
-     (Filter: Keep Crack Only)
-                │
-                ▼
-         U-Net Segmenter
-                │
-             (Mask)
-                │
-                ▼
-      Geometry Extraction (Centerline, Length, Width)
-                │
-                ▼
-      API 570/579 Severity & Alerting (Level 1 / 2 / 3)
-                │
-                ▼
-      Simple BBox Tracker (Assign persistent Track ID)
-                │
-                ▼
- 🚨 ALERT + Save (Full Annotated Frame, JSON Log per Track ID)
+                   (Crack Present?)
+                   /              \
+             (Yes)/                \(No)
+                 ▼                  ▼
+        RF-DETR Detector       Drop Frame
+                 │
+      (Filter: Keep Crack Only)
+                 │
+                 ▼
+          U-Net Segmenter
+                 │
+              (Mask)
+                 │
+                 ▼
+       Geometry Extraction (Centerline, Length, Width)
+                 │
+                 ▼
+       API 570/579 Severity & Alerting (Level 1 / 2 / 3)
+                 │
+                 ▼
+       Simple BBox Tracker (Assign persistent Track ID)
+                 │
+                 ▼
+  🚨 ALERT + Save (Full Annotated Frame, JSON Log per Track ID)
 ```
 
 ---
@@ -100,7 +100,10 @@ Camera (RTSP Stream / Webcam / Video File / Static Image / Synthetic)
 ## 🎯 Key Features
 
 * 🧱 **Real-Time Crack Detection**: Multi-stage deep learning pipeline for localization, segmentation, and classification of structural defects.
-* 🔍 **MobileNetV3 Gating**: Lowers edge hardware execution costs by dynamically filtering out negative frames.
+* 🔍 **Dual-Format Wrapper**: Seamlessly loads both PyTorch (`.pth`) and ONNX (`.onnx`) checkpoints, automatically adapting the pre- and post-processing steps.
+* ⚡ **PyTorch Inference Optimization**: Pre-compiles and optimizes PyTorch checkpoints on load using `optimize_for_inference` to fuse layers and remove edge latency overheads.
+* 💾 **VRAM Downscaling Control**: Automatically downsamples high-resolution frames before running the PyTorch forward pass, performing the upsampling steps on CPU. This prevents `CUDA out of memory` errors on 1080p and 4K streams.
+* 🛡️ **Robust Grayscale Handling**: Automatically converts 2D grayscale camera feeds to 3-channel BGR frames on ingest to prevent overlay shape mismatch crashes.
 * 📏 **Connected Component Geometry**: Labels individual crack segments using `skimage` to measure physical length, mean/max width, and orientation.
 * 🔁 **Redundancy Filter**: Prevents alert flooding by saving exactly one crop JPEG and one JSON metadata report per unique track ID.
 * 📝 **Compliance Mapping**: Automatically determines API 570/579 fitness-for-service severity rankings (`LEVEL_1` to `LEVEL_3`) and recommended maintenance intervals.
@@ -132,9 +135,9 @@ crack_detection_oilgas/
 ├── src/
 │   ├── inference/
 │   │   ├── gate.py             # MobileNetV3 gating classifier inference
-│   │   ├── detector.py         # RF-DETR object detector wrapper
-│   │   ├── segmenter.py        # U-Net segmenter wrapper (with morphological fallback)
-│   │   └── pipeline.py         # Coordinates frame gating, tracking, and snapshots
+│   │   ├── detector.py         # RF-DETR object detector wrapper (with ONNX/PyTorch and downscaling support)
+│   │   ├── segmenter.py        # U-Net segmenter wrapper (with crop & mask processing and morphology fallback)
+│   │   └── pipeline.py         # Decoupled orchestrator coordinating tracking, geometry, and snapshots
 │   │
 │   ├── training/
 │   │   ├── train_gate.py       # Gate classifier training script
@@ -150,7 +153,7 @@ crack_detection_oilgas/
 │       ├── tracking.py         # Simple IOU-based bounding box tracker
 │       └── visualization.py    # Overlays HUD, masks, and severity badges
 │
-├── main.py                     # Entry point (handles synthetic self-test and camera streams)
+├── main.py                     # CLI entry point (handles multiple configurations, camera streams, and self-tests)
 └── README.md
 ```
 
@@ -169,20 +172,24 @@ pipeline:
   alerts_json_dir: "alerts/json"
   alerts_snapshot_dir: "alerts/snapshot"
   min_consecutive_frames: 4
+  force_split_segmentation: false # Force crop segmenter on det.pth
+  enable_detection: true          # Toggle detector stage
+  enable_segmentation: true       # Toggle segmenter stage
+  enable_gate: true               # Toggle gating classifier stage
 
 gate:
-  checkpoint: null
-  threshold: 0.2
+  checkpoint: null                # null uses pretrained MobileNetV3
+  threshold: 0.6                  # Configure to filter background noise
   input_size: [224, 224]
 
 detector:
-  checkpoint: "model/det.pth"
-  threshold: 0.1
+  checkpoint_ema: "model/seg.pth" # Load .pth or .onnx models
+  threshold: 0.45                 # Detection threshold
   input_size: [560, 560]
   target_classes: ["crack", "rebar", "spall"]
 
 segmenter:
-  checkpoint: "model/seg.pth"
+  checkpoint: null                # null uses traditional morphology
   input_size: [256, 256]
   fallback_to_heuristic: true
 
@@ -191,26 +198,6 @@ geometry:
   min_length_px: 20
   min_area_px: 50
   sample_interval: 5
-
-alerting: # legacy alerting config
-  cooldowns:
-    2: 7200
-    3: 600
-
-cameras:
-  - id: cam_1
-    source: 0
-    name: "Brio Webcam"
-    enabled: false
-    use_gstreamer: false
-
-  - id: cam_video
-    source: "/home/vivek/Downloads/istockphoto-2156919688-640_adpp_is.mp4"
-    name: "Video Test"
-    enabled: true
-    use_gstreamer: false
-    playback_fps: 25.0
-    frame_skip: 5  # Process every 5th frame to run faster (playback speedup)
 ```
 
 ---
@@ -240,20 +227,27 @@ pip install -r requirements.txt
 
 ## ▶️ Run
 
-You can run the pipeline directly without specifying environment variables. The entrypoint script dynamically adds project directories to the path:
+The entrypoint script `main.py` supports CLI arguments to run custom configs or camera channels side-by-side:
 
 ```bash
+# Run default camera using default config
 python main.py
+
+# Run a specific camera configuration in config.yaml
+python main.py --camera cam_1
+
+# Run with a custom config file
+python main.py --config config/custom_config.yaml
 ```
 
-* **Note**: If any camera is `enabled: true` in your `config.yaml`, the pipeline immediately boots the live stream. If all cameras are disabled, it falls back to a synthetic self-test run generating `test_input.jpg` and `test_output.jpg`.
+* **Note**: If any camera is `enabled: true` in your active `config.yaml`, the pipeline immediately boots the live stream. If all cameras are disabled, it falls back to a synthetic self-test run generating `test_input.jpg` and `test_output.jpg`.
 
 ---
 
 ## 🚨 Alert System
 
 ### Stage 1 — Gating & Crack Filtering
-MobileNetV3 filters negative frames. Passing frames are processed by RF-DETR. Any detections that are not class `"crack"` (such as rebar or spall) are discarded immediately to keep the system silent on non-crack anomalies.
+MobileNetV3 filters negative frames (if `enable_gate` is active). Passing frames are processed by RF-DETR. Any detections that are not class `"crack"` (such as rebar or spall) are discarded immediately to keep the system silent on non-defect structures.
 
 ### Stage 2 — Measurement & Severity Analysis
 For each unique `track_id`, physical width and length metrics are calculated. If the measurements exceed severity thresholds:
@@ -278,6 +272,8 @@ For each unique `track_id`, physical width and length metrics are calculated. If
 * **Warning Suppression**: Blocks package deprecation output to keep terminal streams clean and readable.
 * **Frame Skipping (`frame_skip`)**: Processes every $N$-th frame (e.g., 1 out of 5 frames), reducing CPU/GPU load to guarantee real-time performance on high-resolution video streams.
 * **Deduplicated Alerting**: Prevents alert flooding by logging exactly one snapshot and JSON report per unique track ID.
+* **Grayscale Auto-Conversion**: Prevents overlay dimension mismatches by converting grayscale camera streams to BGR formats on stream ingest.
+* **GPU Memory Optimization**: Implements high-resolution frame downscaling and CPU-based upsampling during PyTorch inference to prevent CUDA out-of-memory errors.
 
 ---
 

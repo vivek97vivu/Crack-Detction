@@ -60,7 +60,6 @@ class GateInference:
         """
         # Convert numpy array to PIL Image if needed
         if isinstance(image, np.ndarray):
-            # Check shape: if (H, W, C)
             image = Image.fromarray(image)
         elif not isinstance(image, Image.Image):
             raise ValueError("Input image must be a PIL Image or NumPy array")

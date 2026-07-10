@@ -86,15 +86,27 @@ def generate_synthetic_image(output_path):
     return img
 
 def main():
-    # Check for enabled cameras in configuration first
-    config = load_config()
-    cameras = config.get("cameras", [])
-    enabled_cameras = [cam for cam in cameras if cam.get("enabled", True)]
+    import argparse
+    parser = argparse.ArgumentParser(description="Crack Detection Pipeline")
+    parser.add_argument("--config", type=str, default=None, help="Path to custom config.yaml file")
+    parser.add_argument("--camera", type=str, default=None, help="ID of the camera to run (overrides enabled check)")
+    args = parser.parse_args()
     
-    # Initialize pipeline
-    # Configuration will be loaded automatically from config/config.yaml
-    print("\nInitializing Crack Detection Pipeline using config/config.yaml...")
-    pipeline = CrackDetectionPipeline()
+    # Check for enabled cameras in configuration first
+    config = load_config(args.config)
+    cameras = config.get("cameras", [])
+    
+    if args.camera:
+        enabled_cameras = [cam for cam in cameras if cam.get("id") == args.camera]
+        if not enabled_cameras:
+            print(f"Error: Camera ID '{args.camera}' not found in configuration.")
+            return
+    else:
+        enabled_cameras = [cam for cam in cameras if cam.get("enabled", True)]
+        
+    config_desc = args.config if args.config else "config/config.yaml"
+    print(f"\nInitializing Crack Detection Pipeline using {config_desc}...")
+    pipeline = CrackDetectionPipeline(config_path=args.config)
     
     if enabled_cameras:
         camera_cfg = enabled_cameras[0]

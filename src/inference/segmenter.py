@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 from PIL import Image
 from torchvision import transforms
+from src.utils.geometry import extract_geometry
 
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -46,7 +47,6 @@ class UNet(nn.Module):
         x4 = self.down3(x3)
         
         u1 = self.up1(x4)
-        # Handle shape differences if any
         if u1.shape != x3.shape:
             u1 = F.interpolate(u1, size=x3.shape[2:])
         u1 = torch.cat([u1, x3], dim=1)
@@ -97,36 +97,63 @@ class SegmenterInference:
         Returns:
             np.ndarray: Binary mask of shape (H, W) with values 0 or 255.
         """
-        # If crop is empty, return empty mask
         if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
             return np.zeros((256, 256), dtype=np.uint8)
             
         orig_h, orig_w = crop.shape[:2]
         
-        # If fallback_to_heuristic is enabled and we have no trained checkpoint,
-        # we generate a realistic crack mask using image processing (Otsu + Canny/Ridge).
-        # This makes the end-to-end demo look realistic without requiring a segmentation checkpoint.
         if self.fallback_to_heuristic and not self.is_trained:
             gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            # Apply blur
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            # Threshold to find dark pixels (cracks are usually dark lines)
             _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            # Run morphological thinning/cleaning
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
             opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
             return opened
             
-        # Standard deep learning inference
         pil_crop = Image.fromarray(crop)
         x = self.transform(pil_crop).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             logits = self.model(x)
-            prob = torch.sigmoid(logits).squeeze(0).squeeze(0) # shape (256, 256)
+            prob = torch.sigmoid(logits).squeeze(0).squeeze(0)
             mask_256 = (prob >= 0.5).cpu().numpy().astype(np.uint8) * 255
             
-        # Resize mask back to original crop resolution
         mask_orig = cv2.resize(mask_256, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
         return mask_orig
+
+    def process_crop(self, crop, pixel_per_mm, min_length_px, min_area_px, sample_interval, severity_mapper):
+        """
+        Segments a crop and processes geometry + severity.
+        Returns:
+            (mask, geom_list, worst_sev)
+        """
+        mask = self.predict(crop)
+        geom_list, worst_sev = self.process_mask(
+            mask, pixel_per_mm, min_length_px, min_area_px, sample_interval, severity_mapper
+        )
+        return mask, geom_list, worst_sev
+
+    def process_mask(self, mask, pixel_per_mm, min_length_px, min_area_px, sample_interval, severity_mapper):
+        """
+        Processes geometry and severity classification from a binary mask.
+        Returns:
+            (geom_list, worst_sev)
+        """
+        geom_list = extract_geometry(
+            mask, 
+            pixel_per_mm=pixel_per_mm,
+            min_length_px=min_length_px,
+            min_area_px=min_area_px,
+            sample_interval=sample_interval
+        )
+        
+        worst_sev = None
+        if geom_list:
+            severity_results = [
+                severity_mapper.classify(g.width_mean_mm, g.length_mm)
+                for g in geom_list
+            ]
+            worst_sev = severity_mapper.worst_level(severity_results)
+            
+        return geom_list, worst_sev
