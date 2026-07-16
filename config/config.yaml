@@ -15,12 +15,12 @@ pipeline:
 
 gate:
   checkpoint: null
-  threshold: 0.5
+  threshold: 0.9
   input_size: [224, 224]
 
 detector:
   checkpoint_ema: "model/seg.pth"
-  threshold: 0.45
+  threshold: 0.9
   input_size: [560, 560]
   target_classes: ["crack", "rebar", "spall"]
 
@@ -65,7 +65,7 @@ cameras:
 
   - id: cam_2
     source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX"
+    name: "LOREX1"
     enabled: true
     use_gstreamer: true
     codec: "h265"
@@ -74,6 +74,16 @@ cameras:
     drop_on_latency: true
     playback_fps: 0
 
+  - id: cam_3
+    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
+    name: "LOREX2"
+    enabled: true
+    use_gstreamer: true
+    codec: "h265"
+    protocols: "tcp"
+    latency: 0
+    drop_on_latency: true
+    playback_fps: 0
   # - id: cam_video
   #   source: "/home/vivek/Downloads/vecteezy_construction-engineer-photographing-cracked-wall_75011916.mp4"
   #   name: "Video Test"

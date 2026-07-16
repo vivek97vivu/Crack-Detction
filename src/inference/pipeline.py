@@ -63,7 +63,10 @@ class CrackDetectionPipeline:
                  detector_threshold=None,
                  alerts_log=None,
                  fallback_to_heuristic=None,
-                 config_path=None):
+                 config_path=None,
+                 shared_gate=None,
+                 shared_detector=None,
+                 shared_segmenter=None):
         
         # Load configuration
         config = load_config(config_path)
@@ -95,7 +98,9 @@ class CrackDetectionPipeline:
         fallback = fallback_to_heuristic if fallback_to_heuristic is not None else s_cfg.get("fallback_to_heuristic", True)
         
         # 1. Gate Stage
-        if self.enable_gate:
+        if shared_gate is not None:
+            self.gate = shared_gate
+        elif self.enable_gate:
             self.gate = GateInference(
                 checkpoint_path=g_checkpoint, 
                 threshold=g_threshold
@@ -104,18 +109,24 @@ class CrackDetectionPipeline:
             self.gate = None
         
         # 2. Detector Stage
-        self.detector = DetectorInference(
-            checkpoint_path=det_checkpoint, 
-            threshold=det_threshold
-        )
-        if "target_classes" in d_cfg:
-            self.detector.target_classes = d_cfg["target_classes"]
+        if shared_detector is not None:
+            self.detector = shared_detector
+        else:
+            self.detector = DetectorInference(
+                checkpoint_path=det_checkpoint, 
+                threshold=det_threshold
+            )
+            if "target_classes" in d_cfg:
+                self.detector.target_classes = d_cfg["target_classes"]
             
         # 3. Segmenter Stage
-        self.segmenter = SegmenterInference(
-            checkpoint_path=seg_checkpoint,
-            fallback_to_heuristic=fallback
-        )
+        if shared_segmenter is not None:
+            self.segmenter = shared_segmenter
+        else:
+            self.segmenter = SegmenterInference(
+                checkpoint_path=seg_checkpoint,
+                fallback_to_heuristic=fallback
+            )
         
         # 4. Severity Mapper
         self.severity_mapper = APISeverityMapper(config)
