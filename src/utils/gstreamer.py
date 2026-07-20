@@ -33,28 +33,22 @@ def _detect_best_decoder(codec: str) -> str:
     Detect the best available GStreamer decoder element for the given codec.
 
     Returns one of:
-      'jetson_hw'  — nvh265dec / nvh264dec (Jetson Tegra)
-      'nvidia_gpu' — nvdec (x86 NVIDIA GPU via NVDEC)
-      'vaapi'      — vaapih265dec / vaapih264dec (Intel/AMD VA-API)
-      'software'   — avdec_h265 / avdec_h264 (CPU libav)
+      'jetson_hw'       — nvv4l2decoder (Jetson VPU, JP5/JP6 — correct element name)
+      'nvidia_gpu'      — nvh265dec / nvh264dec (x86 NVIDIA GPU NVDEC)
+      'nvidia_gpu_legacy' — nvdec (legacy x86 NVIDIA GPU)
+      'vaapi'           — vaapih265dec / vaapih264dec (Intel/AMD VA-API)
+      'software'        — avdec_h265 / avdec_h264 (CPU libav fallback)
     """
     codec = codec.lower()
 
-    # 1. Jetson hardware decoder (Tegra-specific plugin)
-    jetson_elem = f"nvh{codec[1:]}dec" if codec in ("h264", "h265") else "nvh265dec"
-    if _gst_plugin_available(jetson_elem):
-        try:
-            result = subprocess.run(
-                ["gst-inspect-1.0", jetson_elem],
-                capture_output=True, timeout=5, text=True,
-            )
-            if "nvv4l2" in result.stdout or "Tegra" in result.stdout:
-                logger.info("Decoder selected: Jetson HW (%s)", jetson_elem)
-                return "jetson_hw"
-        except Exception:
-            pass
+    # 1. Jetson VPU hardware decoder — nvv4l2decoder is the correct element on
+    #    JetPack 5.x and 6.x (JP6.2 / R36.x).  The old nvh265dec / nvh264dec
+    #    elements do NOT exist on these platforms.
+    if _gst_plugin_available("nvv4l2decoder"):
+        logger.info("Decoder selected: Jetson HW VPU (nvv4l2decoder)")
+        return "jetson_hw"
 
-    # 2. NVIDIA GPU NVDEC (modern nvh265dec/nvh264dec on x86 NVIDIA GPU)
+    # 2. Modern NVIDIA NVDEC on x86 GPU (gst-plugins-bad nvcodec elements)
     nvdec_elem = f"nvh{codec[1:]}dec" if codec in ("h264", "h265") else "nvh265dec"
     if _gst_plugin_available(nvdec_elem):
         logger.info("Decoder selected: NVIDIA GPU NVDEC (%s)", nvdec_elem)
@@ -81,19 +75,23 @@ def _detect_best_decoder(codec: str) -> str:
 # {drop}      → true | false
 
 _TEMPLATES: dict[str, dict[str, str]] = {
-    # Jetson hardware decoders (nvv4l2 package)
+    # Jetson VPU hardware decoder — nvv4l2decoder is the correct element on
+    # JetPack 5.x and 6.x (JP6.2 / R36.x).  Use nvvidconv (HW colorspace
+    # converter) instead of videoconvert (CPU) for zero-copy BGR conversion.
     "jetson_hw": {
         "h265": (
             "rtspsrc location=\"{url}\" protocols={protocols} "
             "latency={latency} drop-on-latency={drop} buffer-mode=0 ! "
-            "rtph265depay ! h265parse ! nvh265dec ! "
+            "rtph265depay ! h265parse ! nvv4l2decoder ! "
+            "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
         ),
         "h264": (
             "rtspsrc location=\"{url}\" protocols={protocols} "
             "latency={latency} drop-on-latency={drop} buffer-mode=0 ! "
-            "rtph264depay ! h264parse ! nvh264dec ! "
+            "rtph264depay ! h264parse ! nvv4l2decoder ! "
+            "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
         ),
@@ -104,6 +102,7 @@ _TEMPLATES: dict[str, dict[str, str]] = {
             "rtspsrc location=\"{url}\" protocols={protocols} "
             "latency={latency} drop-on-latency={drop} buffer-mode=0 ! "
             "rtph265depay ! h265parse ! nvh265dec ! "
+            "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
         ),
@@ -111,6 +110,7 @@ _TEMPLATES: dict[str, dict[str, str]] = {
             "rtspsrc location=\"{url}\" protocols={protocols} "
             "latency={latency} drop-on-latency={drop} buffer-mode=0 ! "
             "rtph264depay ! h264parse ! nvh264dec ! "
+            "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
         ),

@@ -230,12 +230,16 @@ class CrackDetectionPipeline:
                     if det.class_name == "crack" and (x2 > x1) and (y2 > y1):
                         # Determine if we should use detector's mask or UNet segmenter
                         if det.mask is not None and not self.force_split_segmentation:
-                            mask = det.mask.astype(np.uint8) * 255
-                            mask = mask[y1:y2, x1:x2]
+                            # det.mask is the raw logit mask (144x144). Resize directly to crop width and height.
+                            crop_w, crop_h = (x2 - x1), (y2 - y1)
+                            mask_resized = cv2.resize(det.mask, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                            mask = (mask_resized > 0.0).astype(np.uint8) * 255
+                            
                             # Run geometry and severity mapping on the mask (handled inside segmenter.py)
                             geom_list, worst_sev = self.segmenter.process_mask(
                                 mask, pixel_per_mm, self.min_length_px, self.min_area_px, self.sample_interval, self.severity_mapper
                             )
+
                         else:
                             crop = frame_rgb[y1:y2, x1:x2]
                             # Run crop segmentation, geometry, and severity mapping (handled inside segmenter.py)

@@ -1,265 +1,292 @@
-import sys
-import os
-import time
-import threading
+"""
+main_multistream.py — Multi-camera parallel inference on Jetson AGX Orin.
+
+Loads the RF-DETR detector, gate, and segmenter models ONCE and shares them
+across all enabled camera threads, minimising GPU memory and load-time.
+
+Usage:
+    conda activate crack
+    python main_multistream.py [--config config/config.yaml]
+
+Press 'q' in any display window to quit all streams.
+"""
+
 import cv2
-import torch
-import psutil
 import numpy as np
+import os
+import sys
+import json
+import time
+import logging
+import threading
+import warnings
+import argparse
 
-# Add the project directories to the Python path
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
+warnings.filterwarnings("ignore")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from utils.config import load_config
-from main import get_video_capture
-from inference.pipeline import CrackDetectionPipeline
+from inference.pipeline import CrackDetectionPipeline, Detection, detection_to_dict
+from inference.detector import DetectorInference
+from inference.segmenter import SegmenterInference
+from inference.gate import GateInference
+from utils.config import load_config, resolve_path
+from utils.capture import ThreadedVideoCapture
+from utils.gstreamer import build_gstreamer_capture
 
-gpu_lock = threading.Lock()
+# Enable gstreamer decoder selection logging so we can verify HW decoder is used
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("multistream")
 
-# Statistics and frame buffer dictionary
-stats = {
-    "frames_processed": 0,
-    "lock": threading.Lock(),
-    "cam_fps": {},
-    "latest_frames": {}
-}
 
-class CameraThread(threading.Thread):
-    def __init__(self, camera_cfg, shared_pipeline_args):
-        super().__init__()
-        self.camera_cfg = camera_cfg
-        self.cam_id = camera_cfg.get("id")
-        self.cam_name = camera_cfg.get("name", self.cam_id)
-        self.stopped = False
-        self.daemon = True
-        
-        # Instantiate a camera-specific pipeline with shared models to isolate tracking state
-        self.pipeline = CrackDetectionPipeline(**shared_pipeline_args)
-        
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared model loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_shared_models(config: dict):
+    """Load gate, detector, segmenter once — shared across all camera threads."""
+    p_cfg  = config.get("pipeline", {})
+    g_cfg  = config.get("gate", {})
+    d_cfg  = config.get("detector", {})
+    s_cfg  = config.get("segmenter", {})
+
+    # Gate
+    enable_gate  = p_cfg.get("enable_gate", True)
+    g_checkpoint = resolve_path(g_cfg.get("checkpoint", None))
+    g_threshold  = g_cfg.get("threshold", 0.4)
+    shared_gate  = GateInference(checkpoint_path=g_checkpoint, threshold=g_threshold) if enable_gate else None
+
+    # Detector
+    det_checkpoint  = resolve_path(d_cfg.get("checkpoint") or d_cfg.get("checkpoint_ema"))
+    det_threshold   = d_cfg.get("threshold", 0.3)
+    shared_detector = DetectorInference(checkpoint_path=det_checkpoint, threshold=det_threshold)
+    if "target_classes" in d_cfg:
+        shared_detector.target_classes = d_cfg["target_classes"]
+
+    # Segmenter
+    seg_checkpoint   = resolve_path(s_cfg.get("checkpoint", None))
+    fallback         = s_cfg.get("fallback_to_heuristic", True)
+    shared_segmenter = SegmenterInference(checkpoint_path=seg_checkpoint, fallback_to_heuristic=fallback)
+
+    logger.info("Shared models loaded — gate=%s detector=%s segmenter=%s",
+                type(shared_gate).__name__,
+                type(shared_detector).__name__,
+                type(shared_segmenter).__name__)
+    return shared_gate, shared_detector, shared_segmenter
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera capture helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def open_camera(camera_cfg: dict):
+    """Open a camera using HW-accelerated GStreamer (with threaded capture) or FFMPEG."""
+    source  = camera_cfg.get("source")
+    use_gst = camera_cfg.get("use_gstreamer", False)
+    cam_id  = camera_cfg.get("id", "camera")
+
+    if use_gst and isinstance(source, str) and source.startswith("rtsp://"):
+        logger.info("[%s] Building GStreamer HW-decoder pipeline...", cam_id)
+        raw_cap = build_gstreamer_capture(camera_cfg)
+        if raw_cap.isOpened():
+            logger.info("[%s] GStreamer OK — wrapping in ThreadedVideoCapture", cam_id)
+            return ThreadedVideoCapture(raw_cap)
+        logger.warning("[%s] GStreamer failed — falling back to FFMPEG", cam_id)
+
+    # Local file / webcam fallback
+    if isinstance(source, str):
+        source = os.path.expanduser(source)
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        logger.error("[%s] Failed to open source: %s", cam_id, source)
+        return None
+    return ThreadedVideoCapture(cap)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera worker thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CameraWorker(threading.Thread):
+    def __init__(self, camera_cfg, config_path,
+                 shared_gate, shared_detector, shared_segmenter,
+                 latest_frames, stop_event):
+        super().__init__(daemon=True)
+        self.camera_cfg       = camera_cfg
+        self.cam_id           = camera_cfg.get("id", "cam")
+        self.cam_name         = camera_cfg.get("name", self.cam_id)
+        self.config_path      = config_path
+        self.shared_gate      = shared_gate
+        self.shared_detector  = shared_detector
+        self.shared_segmenter = shared_segmenter
+        self.latest_frames    = latest_frames   # shared dict: cam_id -> annotated_frame
+        self.stop_event       = stop_event
+        self.fps              = 0.0
+
     def run(self):
-        print(f"[Thread-{self.cam_id}] Connecting to source...")
-        cap = get_video_capture(self.camera_cfg)
-        if not cap.isOpened():
-            print(f"[Thread-{self.cam_id}] Error: Could not open stream.")
+        cam_id = self.cam_id
+
+        # Build a per-camera pipeline that reuses shared models
+        pipeline = CrackDetectionPipeline(
+            config_path=self.config_path,
+            shared_gate=self.shared_gate,
+            shared_detector=self.shared_detector,
+            shared_segmenter=self.shared_segmenter,
+        )
+
+        cap = open_camera(self.camera_cfg)
+        if cap is None or not cap.isOpened():
+            logger.error("[%s] Could not open camera — thread exiting.", cam_id)
             return
-            
-        frame_skip = self.camera_cfg.get("frame_skip", 1)
-        if frame_skip < 1:
-            frame_skip = 1
-            
-        fps = self.camera_cfg.get("playback_fps", 25)
-        if fps <= 0:
-            fps = 25
-        # Target interval between frame processing (e.g. 1.0 second for 25 FPS with frame_skip=25)
-        sleep_time = frame_skip / fps
-        print(f"[Thread-{self.cam_id}] Connected! Running. Target interval: {sleep_time:.2f}s")
-        
+
+        frame_skip  = max(1, self.camera_cfg.get("frame_skip", 1))
         frame_count = 0
-        last_time = time.time()
-        local_processed = 0
-        
+        fps_count   = 0
+        fps_t0      = time.time()
+
+        logger.info("[%s] Stream started (frame_skip=%d)", cam_id, frame_skip)
+
         try:
-            while not self.stopped:
-                # Blocks until a new frame is fetched by GStreamer/FFMPEG thread
+            while not self.stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret or frame is None:
+                    logger.warning("[%s] Failed to read frame — retrying...", cam_id)
                     time.sleep(0.1)
                     continue
-                    
+
                 frame_count += 1
-                frame_id = f"{self.cam_id}_frame_{frame_count}"
-                
-                # Run crack detection pipeline with global GPU lock to serialize CUDA calls
-                with gpu_lock:
-                    annotated, meta = self.pipeline.process_frame(frame, frame_id=frame_id)
-                
-                local_processed += 1
-                with stats["lock"]:
-                    stats["frames_processed"] += 1
-                    stats["latest_frames"][self.cam_id] = annotated
-                    
-                # Calculate local FPS occasionally
-                now = time.time()
-                if now - last_time >= 5.0:
-                    fps_val = local_processed / (now - last_time)
-                    with stats["lock"]:
-                        stats["cam_fps"][self.cam_id] = fps_val
-                    local_processed = 0
-                    last_time = now
-                    
-                # Sleep to regulate camera thread loop and free up CPU/GPU scheduling time
-                time.sleep(sleep_time)
-                
-        except Exception as e:
-            print(f"[Thread-{self.cam_id}] Error in run loop: {e}")
+                if frame_count % frame_skip != 0:
+                    continue
+
+                frame_id  = f"{cam_id}_frame_{frame_count}"
+                annotated, _ = pipeline.process_frame(frame, frame_id=frame_id)
+
+                # FPS counter
+                fps_count += 1
+                elapsed    = time.time() - fps_t0
+                if elapsed >= 1.0:
+                    self.fps  = fps_count / elapsed
+                    fps_count = 0
+                    fps_t0    = time.time()
+                    logger.info("[%s] Inference %.1f FPS", cam_id, self.fps)
+
+                # Overlay FPS label on frame
+                cv2.putText(
+                    annotated,
+                    f"{self.cam_name} | INF {self.fps:.1f} FPS",
+                    (10, annotated.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 128), 2, cv2.LINE_AA,
+                )
+
+                # Share latest annotated frame for display thread
+                self.latest_frames[cam_id] = annotated
+
         finally:
             cap.release()
-            print(f"[Thread-{self.cam_id}] Stream closed.")
-            
-    def stop(self):
-        self.stopped = True
+            logger.info("[%s] Stream stopped.", cam_id)
 
-def print_resource_usage():
-    cpu_percent = psutil.cpu_percent(interval=None)
-    memory = psutil.virtual_memory()
-    
-    gpu_memory_used = 0
-    gpu_memory_total = 0
-    gpu_name = "N/A"
-    gpu_load_str = "N/A"
-    
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory_used = torch.cuda.memory_allocated(0) / (1024 * 1024)  # MB
-        gpu_memory_reserved = torch.cuda.memory_reserved(0) / (1024 * 1024)  # MB
-        
-    print(f"\n================ RESOURCE USAGE ================")
-    print(f"CPU Load (Overall): {cpu_percent}%")
-    print(f"RAM Usage: {memory.percent}% ({memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB)")
-    if torch.cuda.is_available():
-        print(f"GPU: {gpu_name}")
-        print(f"GPU VRAM Active: {gpu_memory_used:.1f} MB (Reserved: {gpu_memory_reserved:.1f} MB)")
-    print(f"================================================\n")
 
-def build_grid(frames, grid_size, cell_size):
-    rows, cols = grid_size
-    w, h = cell_size
-    
-    # Create empty black grid
-    grid = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
-    
-    cam_ids = sorted(list(frames.keys()))
-    for idx, cam_id in enumerate(cam_ids):
-        if idx >= rows * cols:
-            break
-        r = idx // cols
-        c = idx % cols
-        
-        frame = frames[cam_id]
-        if frame is not None:
-            # Resize frame to fit cell in the grid
-            resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
-            
-            # Draw camera ID text on top
-            cv2.putText(resized, cam_id, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            grid[r*h:(r+1)*h, c*w:(c+1)*w] = resized
-            
-    return grid
+# ─────────────────────────────────────────────────────────────────────────────
+# Tiled display helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tile_frames(frames, target_w=1280):
+    """Tile a list of frames side-by-side, scaled to target_w total width."""
+    if not frames:
+        return np.zeros((360, target_w, 3), dtype=np.uint8)
+    n      = len(frames)
+    cell_w = target_w // n
+    resized = []
+    for f in frames:
+        h, w   = f.shape[:2]
+        cell_h = int(h * cell_w / w)
+        resized.append(cv2.resize(f, (cell_w, cell_h)))
+    max_h  = max(r.shape[0] for r in resized)
+    padded = []
+    for r in resized:
+        pad = np.zeros((max_h, cell_w, 3), dtype=np.uint8)
+        pad[: r.shape[0], :] = r
+        padded.append(pad)
+    return np.hstack(padded)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Multi-Stream Crack Detection")
-    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config.yaml file")
-    parser.add_argument("--duration", type=int, default=600, help="Duration to run the benchmark in seconds")
-    parser.add_argument("--headless", action="store_true", help="Run in headless mode (no GUI window)")
-    args = parser.parse_args()
-    
-    config = load_config(args.config)
-    cameras = config.get("cameras", [])
-    enabled_cameras = [cam for cam in cameras if cam.get("enabled", True)]
-    
-    if not enabled_cameras:
-        print("Error: No enabled cameras found in configuration.")
+    ap = argparse.ArgumentParser(description="Multi-camera crack detection on Jetson")
+    ap.add_argument("--config", type=str, default=None, help="Path to config.yaml")
+    args = ap.parse_args()
+
+    config      = load_config(args.config)
+    cameras_cfg = config.get("cameras", [])
+    enabled     = [c for c in cameras_cfg if c.get("enabled", True)]
+
+    if not enabled:
+        print("[Error] No enabled cameras found in config. Exiting.")
         return
-        
-    print(f"Loaded {len(enabled_cameras)} enabled cameras from config.")
-    
-    # Load model weights ONCE to share them across threads
-    print("Loading models once into GPU VRAM...")
-    base_pipeline = CrackDetectionPipeline(config_path=args.config)
-    
-    shared_args = {
-        "config_path": args.config,
-        "shared_gate": base_pipeline.gate,
-        "shared_detector": base_pipeline.detector,
-        "shared_segmenter": base_pipeline.segmenter
-    }
-    
-    # Calculate grid layout if displaying GUI
-    if not args.headless:
-        n_cams = len(enabled_cameras)
-        cols = int(np.ceil(np.sqrt(n_cams)))
-        rows = int(np.ceil(n_cams / cols))
-        grid_size = (rows, cols)
-        
-        # Scale cell sizes dynamically so the grid fits on the screen
-        if n_cams <= 4:
-            cell_size = (640, 480)
-        elif n_cams <= 9:
-            cell_size = (480, 360)
-        elif n_cams <= 16:
-            cell_size = (320, 240)
-        else:
-            cell_size = (240, 180) # 30 cameras fits on a 1440x900 grid
-            
-        print(f"Display Mode: Grid window enabled ({rows} rows x {cols} cols, cell: {cell_size[0]}x{cell_size[1]})")
-    
-    # Create and start threads
-    threads = []
-    for cam_cfg in enabled_cameras:
-        thread = CameraThread(cam_cfg, shared_args)
-        threads.append(thread)
-        
-    print(f"Starting {len(threads)} camera stream threads...")
-    for t in threads:
-        t.start()
-        time.sleep(0.05) # brief stagger
-        
-    # Monitor and GUI loop
-    start_time = time.time()
-    last_print = start_time
-    
+
+    print(f"\nInitializing shared models for {len(enabled)} camera(s)...")
+    shared_gate, shared_detector, shared_segmenter = load_shared_models(config)
+
+    latest_frames = {}
+    stop_event    = threading.Event()
+    workers       = []
+
+    for cam_cfg in enabled:
+        w = CameraWorker(
+            camera_cfg=cam_cfg,
+            config_path=args.config,
+            shared_gate=shared_gate,
+            shared_detector=shared_detector,
+            shared_segmenter=shared_segmenter,
+            latest_frames=latest_frames,
+            stop_event=stop_event,
+        )
+        workers.append(w)
+
+    print(f"Starting {len(workers)} camera thread(s)... Press 'q' to quit.\n")
+    for w in workers:
+        w.start()
+
+    cam_ids     = [c.get("id") for c in enabled]
+    has_display = True
+
     try:
-        while time.time() - start_time < args.duration:
-            if args.headless:
-                time.sleep(1.0)
-            else:
-                # Retrieve latest frames and display grid
-                with stats["lock"]:
-                    current_frames = {k: v.copy() for k, v in stats["latest_frames"].items() if v is not None}
-                
-                if current_frames:
-                    grid = build_grid(current_frames, grid_size, cell_size)
-                    cv2.imshow("Crack Detection Multi-Stream Grid (Press 'q' to Quit)", grid)
-                    
-                # OpenCV GUI waitKey handles rendering and keyboard events
-                if cv2.waitKey(30) & 0xFF == ord('q'):
-                    print("\nGUI Window closed by user.")
-                    break
-            
-            # Print console stats every 5 seconds
-            now = time.time()
-            if now - last_print >= 5.0:
-                with stats["lock"]:
-                    total_processed = stats["frames_processed"]
-                    cam_speeds = list(stats["cam_fps"].items())
-                
-                elapsed = now - start_time
-                overall_fps = total_processed / elapsed
-                
-                print(f"\n--- Progress: {elapsed:.1f}s / {args.duration}s ---")
-                print(f"Total Frames Processed: {total_processed}")
-                print(f"Overall Processing FPS: {overall_fps:.2f} frames/sec")
-                print_resource_usage()
-                last_print = now
-                
-    except KeyboardInterrupt:
-        print("\nBenchmark interrupted by user.")
+        while not stop_event.is_set():
+            frames = [latest_frames[cid] for cid in cam_ids if cid in latest_frames]
+            if frames:
+                if has_display:
+                    try:
+                        tiled = tile_frames(frames, target_w=1280 * min(len(frames), 2))
+                        cv2.imshow("Crack Detection — Multi-Stream", tiled)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord("q"):
+                            break
+                    except Exception:
+                        has_display = False   # switch to headless mode
+
+            if not has_display:
+                time.sleep(0.5)
+                fps_strs = [f"{w.cam_name}: {w.fps:.1f} FPS" for w in workers]
+                print("[Multistream] " + " | ".join(fps_strs))
+
+            time.sleep(0.001)
+
     finally:
-        print("Stopping camera threads...")
-        for t in threads:
-            t.stop()
-        for t in threads:
-            t.join(timeout=1.0)
-        
-        if not args.headless:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
-        print("All threads stopped. Benchmark finished.")
+        print("\nShutting down...")
+        stop_event.set()
+        for w in workers:
+            w.join(timeout=3.0)
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        print("All streams stopped.")
+
 
 if __name__ == "__main__":
     main()

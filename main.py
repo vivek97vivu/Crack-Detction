@@ -4,12 +4,10 @@ import os
 import sys
 import json
 import time
+import logging
 import warnings
 
-# Suppress deprecation and future warnings from third-party libraries
 warnings.filterwarnings("ignore")
-
-# Add src/ to the python path so modules can be imported directly
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from inference.pipeline import CrackDetectionPipeline, Detection, detection_to_dict
@@ -17,6 +15,14 @@ from utils.geometry import extract_geometry, draw_geometry
 from utils.severity import SeverityLevel
 from utils.visualization import draw_mask_overlay, draw_severity_badge
 from utils.config import load_config
+from utils.capture import ThreadedVideoCapture
+from utils.gstreamer import build_gstreamer_capture
+
+# Enable gstreamer.py decoder selection logging so we can verify HW decoder is used
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(name)s - %(message)s",
+)
 
 def get_video_capture(camera_config):
     source = camera_config.get("source")
@@ -32,29 +38,22 @@ def get_video_capture(camera_config):
         source = expanded_source
         
     if use_gstreamer and isinstance(source, str) and source.startswith("rtsp://"):
-        # Build GStreamer RTSP pipeline string for OpenCV
-        codec = camera_config.get("codec", "h265")
-        latency = camera_config.get("latency", 0)
-        protocols = camera_config.get("protocols", "tcp")
-        
-        depay = "rtph265depay" if codec == "h265" else "rtph264depay"
-        parser = "h265parse" if codec == "h265" else "h264parse"
-        decoder = "avdec_h265" if codec == "h265" else "avdec_h264"
-        
-        gstreamer_str = (
-            f"rtspsrc location=\"{source}\" latency={latency} protocols={protocols} ! "
-            f"{depay} ! {parser} ! {decoder} ! videoconvert ! appsink drop=true sync=false"
-        )
-        print(f"Opening RTSP stream using GStreamer: {gstreamer_str}")
-        cap = cv2.VideoCapture(gstreamer_str, cv2.CAP_GSTREAMER)
-        if cap.isOpened():
-            return cap
+        # Use the smart GStreamer builder that auto-detects the best HW decoder
+        # (nvv4l2decoder on Jetson, nvh265dec on x86 NVIDIA, vaapi on AMD/Intel,
+        #  avdec_h265 as CPU fallback). Falls through tiers until one works.
+        print(f"Building GStreamer pipeline with auto HW-decoder selection...")
+        raw_cap = build_gstreamer_capture(camera_config)
+        if raw_cap.isOpened():
+            # Wrap in ThreadedVideoCapture — decouples frame grabbing from
+            # inference so the RTSP buffer never accumulates.
+            print(f"Wrapping capture in ThreadedVideoCapture (async frame grabber)...")
+            return ThreadedVideoCapture(raw_cap)
             
-        print("[Warning] GStreamer pipeline failed to open. Falling back to FFMPEG reader...")
+        print("[Warning] GStreamer capture failed. Falling back to FFMPEG reader...")
         
-    # Standard OpenCV source (int or string)
+    # Standard OpenCV source (int or string path)
     print(f"Opening video source via FFMPEG: {source}")
-    return cv2.VideoCapture(source)
+    return ThreadedVideoCapture(cv2.VideoCapture(source))
 
 def generate_synthetic_image(output_path):
     """
@@ -132,10 +131,14 @@ def main():
             print(f"Target playback speed: {playback_fps} FPS (Frame delay: {delay_ms}ms)")
             
         frame_count = 0
+        fps_display = 0.0
+        fps_timer_start = time.time()
+        fps_frame_count = 0
+        
         try:
             while True:
                 ret, frame = cap.read()
-                if not ret:
+                if not ret or frame is None:
                     print("End of video stream or failed to fetch frame.")
                     break
                     
@@ -148,6 +151,20 @@ def main():
                 # Process the frame
                 annotated, meta = pipeline.process_frame(frame, frame_id=frame_id)
                 
+                # Compute and overlay real-time FPS
+                fps_frame_count += 1
+                elapsed = time.time() - fps_timer_start
+                if elapsed >= 1.0:
+                    fps_display = fps_frame_count / elapsed
+                    fps_frame_count = 0
+                    fps_timer_start = time.time()
+                cv2.putText(
+                    annotated,
+                    f"INF {fps_display:.1f} FPS",
+                    (annotated.shape[1] - 160, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 128), 2, cv2.LINE_AA
+                )
+                
                 # Try to show the live feed if GUI backend is available
                 try:
                     cv2.imshow(f"Crack Detection Live - {cam_name}", annotated)
@@ -156,7 +173,7 @@ def main():
                 except Exception:
                     # Headless mode fallback: print progress periodically
                     if frame_count % 30 == 0:
-                        print(f"[Headless Live] Processed {frame_count} frames...")
+                        print(f"[Headless Live] Processed {frame_count} frames | INF {fps_display:.1f} FPS")
         finally:
             cap.release()
             try:
@@ -213,7 +230,7 @@ def main():
                 det = Detection(
                     bbox_xyxy=np.array(mock_box, dtype=int),
                     class_name="crack",
-                    confidence=0.92,
+                    confidence=0,
                     class_id=0,
                     track_id=1,
                     geometry=geom_list,

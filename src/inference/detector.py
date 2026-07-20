@@ -3,10 +3,15 @@ import numpy as np
 import cv2
 import onnxruntime
 import torch
+import os
+import logging
 from dataclasses import dataclass
 from typing import Optional, List
 from src.utils.geometry import CrackGeometry
 from src.utils.severity import SeverityResult
+from src.inference.trt_engine import TRTEngineBackend, is_available as trt_is_available
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Detection:
@@ -19,47 +24,153 @@ class Detection:
     severity: Optional[SeverityResult] = None
     mask: Optional[np.ndarray] = None
 
+
+def _build_ort_session(onnx_path: str, trt_cache_dir: str = "model/trt_cache") -> onnxruntime.InferenceSession:
+    """
+    Build an ONNX Runtime InferenceSession with the best available GPU provider.
+    Priority: TensorrtExecutionProvider > CUDAExecutionProvider > CPU.
+
+    TensorRT EP compiles the model to a TensorRT engine on first run (slow, ~1-3 min)
+    then caches it — subsequent runs load instantly and are 3-10x faster.
+    """
+    available = onnxruntime.get_available_providers()
+    logger.info("ORT available providers: %s", available)
+
+    # Shared session options: maximize graph optimization
+    sess_opts = onnxruntime.SessionOptions()
+    sess_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    sess_opts.intra_op_num_threads = 4
+
+    # ── 1. TensorRT EP (fastest — JIT compiles to TRT engine, cached to disk) ──
+    if "TensorrtExecutionProvider" in available:
+        os.makedirs(trt_cache_dir, exist_ok=True)
+        trt_opts = {
+            "device_id": 0,
+            "trt_max_workspace_size":      2 * 1024 * 1024 * 1024,  # 2 GB
+            "trt_fp16_enable":             True,   # FP16 → 2x speed vs FP32
+            "trt_engine_cache_enable":     True,   # Cache engine to avoid recompile
+            "trt_engine_cache_path":       trt_cache_dir,
+            "trt_timing_cache_enable":     True,
+            "trt_timing_cache_path":       trt_cache_dir,
+        }
+        cuda_opts = {"device_id": 0, "cudnn_conv_algo_search": "DEFAULT"}
+        try:
+            sess = onnxruntime.InferenceSession(
+                onnx_path,
+                sess_options=sess_opts,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider",     cuda_opts),
+                    "CPUExecutionProvider",
+                ],
+            )
+            active = sess.get_providers()[0]
+            logger.info("ORT session active EP: %s", active)
+            print(f"  [GPU] ORT active provider: {active}")
+            return sess
+        except Exception as e:
+            logger.warning("TensorRT EP init failed (%s) — trying CUDA EP", e)
+
+    # ── 2. CUDA EP (fast — runs on Jetson GPU via ORT's own CUDA 12.6 runtime) ──
+    if "CUDAExecutionProvider" in available:
+        cuda_opts = {
+            "device_id": 0,
+            "cudnn_conv_algo_search": "DEFAULT",
+            "do_copy_in_default_stream": True,
+        }
+        try:
+            sess = onnxruntime.InferenceSession(
+                onnx_path,
+                sess_options=sess_opts,
+                providers=[
+                    ("CUDAExecutionProvider", cuda_opts),
+                    "CPUExecutionProvider",
+                ],
+            )
+            active = sess.get_providers()[0]
+            logger.info("ORT session active EP: %s", active)
+            print(f"  [GPU] ORT active provider: {active}")
+            return sess
+        except Exception as e:
+            logger.warning("CUDA EP init failed (%s) — falling back to CPU", e)
+
+    # ── 3. CPU fallback ──
+    print("  [WARN] Running on CPU — no GPU execution provider available")
+    return onnxruntime.InferenceSession(
+        onnx_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
+    )
+
+
 class DetectorInference:
     """
-    Wrapper for RF-DETR object detector that handles model loading,
-    inference, and mapping of the 4 trained classes down to 3 clean target classes.
-    Supports both PyTorch (.pth) checkpoints and ONNX (.onnx) exports.
+    Wrapper for RF-DETR object detector.
+    Supports:
+      - TRT (.engine): Native TensorRT — fastest, instant startup, no ORT overhead
+      - ONNX (.onnx):  GPU via ORT TensorRT/CUDA EP — auto-compiles TRT on first run
+      - PyTorch (.pth): CPU-only fallback
     """
     def __init__(self, checkpoint_path, threshold=0.3):
         self.threshold = threshold
         self.target_classes = ["crack", "rebar", "spall"]
-        
-        if checkpoint_path.endswith(".onnx"):
-            print(f"Loading RF-DETR model from ONNX checkpoint: {checkpoint_path}")
+        self.use_trt    = False
+        self.use_onnx   = False
+        self.trt_engine = None
+        self.session    = None
+        self.model      = None
+
+        if checkpoint_path.endswith(".engine"):
+            # ── Native TRT engine (fastest — pre-compiled, no ORT overhead) ──
+            if not trt_is_available():
+                raise RuntimeError(
+                    "TRT engine loading failed: TensorRT Python bindings or "
+                    "libcudart.so not found. Use the .onnx checkpoint instead."
+                )
+            print(f"Loading RF-DETR model from TensorRT engine: {checkpoint_path}")
+            self.use_trt    = True
+            self.trt_engine = TRTEngineBackend(checkpoint_path)
+            # Derive input shape from first input tensor
+            inp = self.trt_engine._inputs[0]
+            shape = inp["shape"]
+            self.input_h = int(shape[2]) if shape[2] > 0 else 576
+            self.input_w = int(shape[3]) if shape[3] > 0 else 576
+            print(f"  [GPU] TRT engine loaded — input: {self.input_h}x{self.input_w}")
+
+        elif checkpoint_path.endswith(".onnx"):
+            # ── ONNX via ORT TensorRT/CUDA EP ──
+            print(f"Loading RF-DETR model from ONNX (GPU via ORT): {checkpoint_path}")
             self.use_onnx = True
-            self.session = onnxruntime.InferenceSession(checkpoint_path)
+            trt_cache = os.path.join(os.path.dirname(checkpoint_path), "trt_cache")
+            self.session = _build_ort_session(checkpoint_path, trt_cache_dir=trt_cache)
             self.input_name = self.session.get_inputs()[0].name
             input_shape = self.session.get_inputs()[0].shape
-            self.input_h = input_shape[2]
-            self.input_w = input_shape[3]
+            self.input_h = input_shape[2] if isinstance(input_shape[2], int) else 576
+            self.input_w = input_shape[3] if isinstance(input_shape[3], int) else 576
+
         else:
+            # ── PyTorch fallback ──
             print(f"Loading RF-DETR model from PyTorch checkpoint: {checkpoint_path}")
-            self.use_onnx = False
             self.model = rfdetr.from_checkpoint(checkpoint_path)
-            
-            # Call rfdetr optimization to prevent PyTorch inference delay
             try:
                 print("Optimizing PyTorch model for inference...")
                 self.model.optimize_for_inference(compile=False)
             except Exception as e:
                 print(f"Warning: Could not optimize PyTorch model: {e}")
-        
+
+
     def predict(self, image):
         """
         Runs object detection on the image.
         Returns:
             list[dict]: A list of detections with mapped class IDs and labels.
         """
-        if self.use_onnx:
+        if self.use_trt:
+            return self._predict_trt(image)
+        elif self.use_onnx:
             return self._predict_onnx(image)
         else:
             return self._predict_pytorch(image)
-            
+
     def process(self, frame_rgb, tracker):
         """
         Runs prediction, maps raw outputs to Detection objects, and updates tracker.
@@ -149,10 +260,103 @@ class DetectorInference:
             
         return results
 
+    def _predict_trt(self, image):
+        """Native TRT inference — same pre/post-processing as _predict_onnx."""
+        h_orig, w_orig = image.shape[:2]
+
+        # Pre-process (identical to ONNX path)
+        if image.ndim == 3 and image.shape[2] == 4:
+            image = image[:, :, :3]
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
+        img_float = img_resized.astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img_normalized = (img_float - mean) / std
+        inp_tensor = np.ascontiguousarray(
+            np.transpose(img_normalized, (2, 0, 1))[np.newaxis, ...], dtype=np.float32
+        )
+
+        # Run native TRT inference
+        input_name = self.trt_engine.input_names[0]
+        raw_outputs = self.trt_engine.infer({input_name: inp_tensor})
+
+        # Map outputs by name (same convention as ONNX path)
+        output_names = list(raw_outputs.keys())
+        boxes_key  = next((k for k in output_names if "dets"   in k), output_names[0])
+        logits_key = next((k for k in output_names if "labels" in k),
+                          output_names[1] if len(output_names) > 1 else output_names[0])
+        masks_key  = next((k for k in output_names if "masks"  in k), None)
+
+        boxes_cwh = raw_outputs[boxes_key][0]           # (Q, 4) cx,cy,w,h normalised
+        logits    = raw_outputs[logits_key][0, :, :-1]  # (Q, num_classes)
+        raw_masks = raw_outputs[masks_key][0] if masks_key else None  # (Q, Hm, Wm) float32 logits
+
+        # Post-process (identical to ONNX path)
+        one = np.asarray(1, dtype=logits.dtype)
+        scores_all = one / (one + np.exp(-logits.clip(-88, 88)))
+        scores = scores_all.max(axis=-1)
+        cls    = scores_all.argmax(axis=-1)
+
+        keep = scores >= self.threshold
+        if not np.any(keep):
+            return []
+
+        kept_boxes   = boxes_cwh[keep]
+        kept_scores  = scores[keep]
+        kept_classes = cls[keep]
+        kept_masks   = raw_masks[keep] if raw_masks is not None else None  # (K, Hm, Wm)
+
+        # Convert cx,cy,w,h → x1,y1,x2,y2
+        cx, cy, bw, bh = kept_boxes.T
+        x1 = (cx - bw / 2) * w_orig
+        y1 = (cy - bh / 2) * h_orig
+        x2 = (cx + bw / 2) * w_orig
+        y2 = (cy + bh / 2) * h_orig
+
+        results = []
+        for i in range(len(kept_boxes)):
+            orig_cid = int(kept_classes[i])
+            conf     = float(kept_scores[i])
+
+            # Same class ID mapping as _predict_onnx
+            if orig_cid in (0, 1):
+                mapped_cid = 0   # crack
+            elif orig_cid == 2:
+                mapped_cid = 1   # rebar
+            elif orig_cid == 3:
+                mapped_cid = 2   # spall
+            else:
+                continue
+
+            x1_c = max(0, min(w_orig, int(x1[i])))
+            y1_c = max(0, min(h_orig, int(y1[i])))
+            x2_c = max(0, min(w_orig, int(x2[i])))
+            y2_c = max(0, min(h_orig, int(y2[i])))
+
+            det_dict = {
+                "box":        [x1_c, y1_c, x2_c, y2_c],
+                "confidence": conf,
+                "class_id":   mapped_cid,
+                "class_name": self.target_classes[mapped_cid],
+            }
+            # Store raw float32 logit mask (Hm, Wm) — pipeline.py resizes on demand
+            if kept_masks is not None:
+                det_dict["mask"] = kept_masks[i]
+
+            results.append(det_dict)
+
+        return results
+
+
     def _predict_onnx(self, image):
         h_orig, w_orig = image.shape[:2]
         
         # 1. Preprocessing: BGR to RGB, Resize, Float, Normalize
+        # Guard: nvvidconv on Jetson may output BGRx (4-channel) even when
+        # pipeline requests format=BGR.  Drop the alpha channel if present.
+        if image.ndim == 3 and image.shape[2] == 4:
+            image = image[:, :, :3]
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         img_resized = cv2.resize(img_rgb, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
         img_float = img_resized.astype(np.float32) / 255.0
@@ -203,15 +407,8 @@ class DetectorInference:
         if has_masks:
             raw_masks = raw_outputs[masks_idx][0]  # (Q, Hm, Wm)
             kept_masks = raw_masks[keep]
-            
-            decoded_masks = []
-            for idx in range(len(kept_boxes)):
-                mask_logit = kept_masks[idx]
-                # Resize mask to original input size
-                mask_resized = cv2.resize(mask_logit, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-                # Convert logit to binary mask
-                mask_binary = mask_resized > 0.0
-                decoded_masks.append(mask_binary)
+            # Keep raw logits (typically 144x144). Will resize directly to bounding box crop later.
+            decoded_masks = list(kept_masks)
                 
         # 3. Build result dictionaries
         for i in range(len(kept_boxes)):
