@@ -1,7 +1,15 @@
-import cv2
-import numpy as np
 import os
 import sys
+
+# Auto-switch to 'crack' conda python & set LD_LIBRARY_PATH for C++ GLIBCXX compatibility
+crack_python = "/home/algosium/miniforge3/envs/crack/bin/python"
+crack_lib    = "/home/algosium/miniforge3/envs/crack/lib"
+if os.path.exists(crack_python) and (sys.executable != crack_python or crack_lib not in os.environ.get("LD_LIBRARY_PATH", "")):
+    os.environ["LD_LIBRARY_PATH"] = f"{crack_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    os.execv(crack_python, [crack_python] + sys.argv)
+
+import cv2
+import numpy as np
 import json
 import time
 import logging

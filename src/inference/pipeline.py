@@ -97,7 +97,7 @@ class CrackDetectionPipeline:
         seg_checkpoint = resolve_path(seg_checkpoint)
         fallback = fallback_to_heuristic if fallback_to_heuristic is not None else s_cfg.get("fallback_to_heuristic", True)
         
-        # 1. Gate Stage
+        # 1. Gate Stage -mobilenetv3-small binary classifier
         if shared_gate is not None:
             self.gate = shared_gate
         elif self.enable_gate:
@@ -108,18 +108,23 @@ class CrackDetectionPipeline:
         else:
             self.gate = None
         
-        # 2. Detector Stage
+        # 2. Detector Stage (RF-DETR Instance Segmentation Model)
+        self.enable_detection = p_cfg.get("enable_detection", True)
+        self.enable_segmentation = p_cfg.get("enable_segmentation", True)
+        
         if shared_detector is not None:
             self.detector = shared_detector
-        else:
+        elif self.enable_detection:
             self.detector = DetectorInference(
                 checkpoint_path=det_checkpoint, 
                 threshold=det_threshold
             )
             if "target_classes" in d_cfg:
                 self.detector.target_classes = d_cfg["target_classes"]
+        else:
+            self.detector = None
             
-        # 3. Segmenter Stage
+        # 3. POST-PROCESSING
         if shared_segmenter is not None:
             self.segmenter = shared_segmenter
         else:
@@ -161,7 +166,7 @@ class CrackDetectionPipeline:
         self.alerts_json_dir = resolve_path(p_cfg.get("alerts_json_dir", "alerts/json"))
         self.alerts_snapshot_dir = resolve_path(p_cfg.get("alerts_snapshot_dir", "alerts/snapshot"))
 
-    def process_frame(self, frame_bgr, frame_id, pixel_per_mm=None):
+    def process_frame(self, frame_bgr, frame_id, pixel_per_mm=None, detector_outputs=None):
         if len(frame_bgr.shape) == 2:
             frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
             
@@ -199,8 +204,12 @@ class CrackDetectionPipeline:
         
         # --- Stage 2 & 3 Dynamic Paths ---
         if self.enable_detection:
-            # Stage 2: Detector and tracker (handled inside detector.py)
-            detections = self.detector.process(frame_rgb, self.tracker)
+            # Stage 2: Detector and tracker
+            if detector_outputs is not None:
+                detections = self.detector.post_predict_and_track(detector_outputs, self.tracker, frame_rgb.shape)
+            else:
+                detections = self.detector.process(frame_rgb, self.tracker)
+
             
             # Update track frame counts
             for det in detections:

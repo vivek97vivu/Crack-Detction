@@ -3,8 +3,11 @@ import numpy as np
 import cv2
 import onnxruntime
 import torch
+import torch.nn.functional as F
 import os
 import logging
+import queue
+import threading
 from dataclasses import dataclass
 from typing import Optional, List
 from src.utils.geometry import CrackGeometry
@@ -40,30 +43,24 @@ def _build_ort_session(onnx_path: str, trt_cache_dir: str = "model/trt_cache") -
     sess_opts = onnxruntime.SessionOptions()
     sess_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     sess_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-    sess_opts.intra_op_num_threads = 4
 
-    # ── 1. TensorRT EP (fastest — JIT compiles to TRT engine, cached to disk) ──
+    # ── 1. Try TensorRT Execution Provider ──
     if "TensorrtExecutionProvider" in available:
-        os.makedirs(trt_cache_dir, exist_ok=True)
-        trt_opts = {
-            "device_id": 0,
-            "trt_max_workspace_size":      2 * 1024 * 1024 * 1024,  # 2 GB
-            "trt_fp16_enable":             True,   # FP16 → 2x speed vs FP32
-            "trt_engine_cache_enable":     True,   # Cache engine to avoid recompile
-            "trt_engine_cache_path":       trt_cache_dir,
-            "trt_timing_cache_enable":     True,
-            "trt_timing_cache_path":       trt_cache_dir,
-        }
-        cuda_opts = {"device_id": 0, "cudnn_conv_algo_search": "DEFAULT"}
         try:
+            os.makedirs(trt_cache_dir, exist_ok=True)
+            trt_options = {
+                "device_id": "0",
+                "trt_max_workspace_size": str(4 * 1024 * 1024 * 1024),  # 4 GB
+                "trt_fp16_enable": "1",
+                "trt_engine_cache_enable": "1",
+                "trt_engine_cache_path": trt_cache_dir,
+                "trt_dla_enable": "0",
+            }
+            logger.info("Initializing ORT with TensorRT EP (cache: %s)...", trt_cache_dir)
             sess = onnxruntime.InferenceSession(
                 onnx_path,
                 sess_options=sess_opts,
-                providers=[
-                    ("TensorrtExecutionProvider", trt_opts),
-                    ("CUDAExecutionProvider",     cuda_opts),
-                    "CPUExecutionProvider",
-                ],
+                providers=[("TensorrtExecutionProvider", trt_options), "CUDAExecutionProvider", "CPUExecutionProvider"],
             )
             active = sess.get_providers()[0]
             logger.info("ORT session active EP: %s", active)
@@ -72,21 +69,21 @@ def _build_ort_session(onnx_path: str, trt_cache_dir: str = "model/trt_cache") -
         except Exception as e:
             logger.warning("TensorRT EP init failed (%s) — trying CUDA EP", e)
 
-    # ── 2. CUDA EP (fast — runs on Jetson GPU via ORT's own CUDA 12.6 runtime) ──
+    # ── 2. Fallback to CUDA Execution Provider ──
     if "CUDAExecutionProvider" in available:
-        cuda_opts = {
-            "device_id": 0,
-            "cudnn_conv_algo_search": "DEFAULT",
-            "do_copy_in_default_stream": True,
-        }
         try:
+            cuda_options = {
+                "device_id": "0",
+                "arena_extend_strategy": "kNextPowerOfTwo",
+                "gpu_mem_limit": str(4 * 1024 * 1024 * 1024),
+                "cudnn_conv_algo_search": "EXHAUSTIVE",
+                "do_copy_in_default_stream": "1",
+            }
+            logger.info("Initializing ORT with CUDA EP...")
             sess = onnxruntime.InferenceSession(
                 onnx_path,
                 sess_options=sess_opts,
-                providers=[
-                    ("CUDAExecutionProvider", cuda_opts),
-                    "CPUExecutionProvider",
-                ],
+                providers=[("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"],
             )
             active = sess.get_providers()[0]
             logger.info("ORT session active EP: %s", active)
@@ -110,12 +107,13 @@ class DetectorInference:
       - ONNX (.onnx):  GPU via ORT TensorRT/CUDA EP — auto-compiles TRT on first run
       - PyTorch (.pth): CPU-only fallback
     """
-    def __init__(self, checkpoint_path, threshold=0.3):
+    def __init__(self, checkpoint_path, threshold=0.3, num_engines=3):
         self.threshold = threshold
         self.target_classes = ["crack", "rebar", "spall"]
         self.use_trt    = False
         self.use_onnx   = False
         self.trt_engine = None
+        self.trt_engine_pool = queue.Queue()
         self.session    = None
         self.model      = None
 
@@ -126,15 +124,18 @@ class DetectorInference:
                     "TRT engine loading failed: TensorRT Python bindings or "
                     "libcudart.so not found. Use the .onnx checkpoint instead."
                 )
-            print(f"Loading RF-DETR model from TensorRT engine: {checkpoint_path}")
-            self.use_trt    = True
-            self.trt_engine = TRTEngineBackend(checkpoint_path)
+            print(f"Loading RF-DETR model ({num_engines}x parallel engines) from TensorRT engine: {checkpoint_path}")
+            self.use_trt = True
+            for i in range(num_engines):
+                eng = TRTEngineBackend(checkpoint_path)
+                self.trt_engine_pool.put(eng)
+            self.trt_engine = eng
             # Derive input shape from first input tensor
             inp = self.trt_engine._inputs[0]
             shape = inp["shape"]
             self.input_h = int(shape[2]) if shape[2] > 0 else 576
             self.input_w = int(shape[3]) if shape[3] > 0 else 576
-            print(f"  [GPU] TRT engine loaded — input: {self.input_h}x{self.input_w}")
+            print(f"  [GPU] {num_engines}x TRT engine pool loaded — input: {self.input_h}x{self.input_w}")
 
         elif checkpoint_path.endswith(".onnx"):
             # ── ONNX via ORT TensorRT/CUDA EP ──
@@ -198,6 +199,169 @@ class DetectorInference:
             ))
             
         return tracker.update(raw_detections)
+
+    def predict_batch(self, images):
+        """
+        Runs batched object detection on a list of images.
+        Uses GPU-accelerated PyTorch preprocessing and zero-copy TRT inference.
+
+        Args:
+            images (list[np.ndarray]): List of BGR images.
+        Returns:
+            list[list[dict]]: List of detections for each image.
+        """
+        if not self.use_trt or not torch.cuda.is_available():
+            # Fallback: run sequentially for ONNX/PyTorch backends
+            return [self.predict(img) for img in images]
+
+        batch_size = len(images)
+        if batch_size == 0:
+            return []
+
+        # 1. Preprocess batch on GPU via PyTorch
+        gpu_tensors = []
+        orig_shapes = []
+        for img in images:
+            h_orig, w_orig = img.shape[:2]
+            orig_shapes.append((h_orig, w_orig))
+
+            if img.ndim == 3 and img.shape[2] == 4:
+                img = img[:, :, :3]
+
+            # Upload BGR frame to GPU (very fast uint8 transfer)
+            t = torch.from_numpy(img).to('cuda', non_blocking=True) # H x W x 3 (uint8)
+            # Flip BGR -> RGB
+            t = t.flip(2)
+            # Permute to C x H x W
+            t = t.permute(2, 0, 1).float() # C x H x W (float32)
+            gpu_tensors.append(t)
+
+        # Stack into N x C x H x W
+        stacked = torch.stack(gpu_tensors)
+
+        # Resize to input_h, input_w
+        resized = F.interpolate(
+            stacked, size=(self.input_h, self.input_w),
+            mode='bilinear', align_corners=False
+        )
+
+        # Normalize: (pixel / 255.0 - mean) / std
+        resized /= 255.0
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device='cuda').view(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device='cuda').view(1, 3, 1, 1)
+        normalized = (resized - mean) / std
+
+        inp_tensor = normalized.contiguous()
+
+        # 2. Run batched TRT inference using PyTorch pointers
+        engine = self.trt_engine_pool.get() if hasattr(self, "trt_engine_pool") and not self.trt_engine_pool.empty() else self.trt_engine
+        try:
+            input_name = engine.input_names[0]
+            raw_outputs = engine.infer_pytorch({input_name: inp_tensor})
+        finally:
+            if hasattr(self, "trt_engine_pool"):
+                self.trt_engine_pool.put(engine)
+
+        # Map outputs by name
+        output_names = list(raw_outputs.keys())
+        boxes_key  = next((k for k in output_names if "dets"   in k), output_names[0])
+        logits_key = next((k for k in output_names if "labels" in k),
+                          output_names[1] if len(output_names) > 1 else output_names[0])
+        masks_key  = next((k for k in output_names if "masks"  in k), None)
+
+        boxes_cwh = raw_outputs[boxes_key]           # (B, Q, 4) cx,cy,w,h normalised
+        logits    = raw_outputs[logits_key][..., :-1] # (B, Q, num_classes)
+        raw_masks = raw_outputs[masks_key] if masks_key else None  # (B, Q, Hm, Wm) float32 logits
+
+        # 3. Post-process (sigmoid, thresholding done on GPU)
+        scores_all = torch.sigmoid(logits.clamp(-88, 88))
+        scores, cls = scores_all.max(dim=-1) # (B, Q), (B, Q)
+
+        batch_results = []
+        for b in range(batch_size):
+            h_orig, w_orig = orig_shapes[b]
+            b_scores = scores[b]
+            b_cls = cls[b]
+            b_boxes = boxes_cwh[b]
+            b_masks = raw_masks[b] if raw_masks is not None else None
+
+            keep = b_scores >= self.threshold
+            keep_idx = torch.where(keep)[0]
+
+            if len(keep_idx) == 0:
+                batch_results.append([])
+                continue
+
+            # Copy only filtered predictions to host CPU memory
+            kept_scores = b_scores[keep_idx].cpu().numpy()
+            kept_classes = b_cls[keep_idx].cpu().numpy()
+            kept_boxes = b_boxes[keep_idx].cpu().numpy()
+            kept_masks = b_masks[keep_idx].cpu().numpy() if b_masks is not None else None
+
+            cx, cy, bw, bh = kept_boxes.T
+            x1 = (cx - bw / 2) * w_orig
+            y1 = (cy - bh / 2) * h_orig
+            x2 = (cx + bw / 2) * w_orig
+            y2 = (cy + bh / 2) * h_orig
+
+            results = []
+            for i in range(len(keep_idx)):
+                orig_cid = int(kept_classes[i])
+                conf     = float(kept_scores[i])
+
+                if orig_cid in (0, 1):
+                    mapped_cid = 0
+                elif orig_cid == 2:
+                    mapped_cid = 1
+                elif orig_cid == 3:
+                    mapped_cid = 2
+                else:
+                    continue
+
+                x1_c = max(0, min(w_orig, int(x1[i])))
+                y1_c = max(0, min(h_orig, int(y1[i])))
+                x2_c = max(0, min(w_orig, int(x2[i])))
+                y2_c = max(0, min(h_orig, int(y2[i])))
+
+                det_dict = {
+                    "box":        [x1_c, y1_c, x2_c, y2_c],
+                    "confidence": conf,
+                    "class_id":   mapped_cid,
+                    "class_name": self.target_classes[mapped_cid],
+                }
+                if kept_masks is not None:
+                    det_dict["mask"] = kept_masks[i]
+
+                results.append(det_dict)
+
+            batch_results.append(results)
+
+        return batch_results
+
+    def post_predict_and_track(self, detector_outputs, tracker, img_shape):
+        """
+        Runs tracking on pre-computed detector outputs.
+        """
+        h, w = img_shape[:2]
+        raw_detections = []
+        for det in detector_outputs:
+            if det["class_name"] != "crack":
+                continue
+            box = det["box"]
+            x1, y1, x2, y2 = map(int, box)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+
+            raw_detections.append(Detection(
+                bbox_xyxy=np.array([x1, y1, x2, y2], dtype=int),
+                class_name=det["class_name"],
+                confidence=det["confidence"],
+                class_id=det["class_id"],
+                mask=det.get("mask")
+            ))
+
+        return tracker.update(raw_detections)
+
 
     def _predict_pytorch(self, image):
         h_orig, w_orig = image.shape[:2]
@@ -278,8 +442,13 @@ class DetectorInference:
         )
 
         # Run native TRT inference
-        input_name = self.trt_engine.input_names[0]
-        raw_outputs = self.trt_engine.infer({input_name: inp_tensor})
+        engine = self.trt_engine_pool.get() if hasattr(self, "trt_engine_pool") and not self.trt_engine_pool.empty() else self.trt_engine
+        try:
+            input_name = engine.input_names[0]
+            raw_outputs = engine.infer({input_name: inp_tensor})
+        finally:
+            if hasattr(self, "trt_engine_pool"):
+                self.trt_engine_pool.put(engine)
 
         # Map outputs by name (same convention as ONNX path)
         output_names = list(raw_outputs.keys())

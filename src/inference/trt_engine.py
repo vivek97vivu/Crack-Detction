@@ -19,9 +19,11 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 from typing import Dict, List, Optional
 
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,7 @@ class TRTEngineBackend:
 
         self._context = self._engine.create_execution_context()
         self._stream  = _cuda_stream_create()
+        self._lock    = threading.Lock()  # Serialise GPU calls — IExecutionContext is NOT thread-safe
 
         # ── Discover I/O tensors (TRT 10 API) ────────────────────────────
         self._inputs:  List[dict] = []
@@ -185,7 +188,9 @@ class TRTEngineBackend:
 
     def infer(self, feed: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
-        Run one forward pass.
+        Run one forward pass.  Thread-safe: GPU execution is serialised by an
+        internal lock so multiple camera threads can share one engine safely.
+        CPU-side preprocessing should be done BEFORE calling this method.
 
         Parameters
         ----------
@@ -195,54 +200,120 @@ class TRTEngineBackend:
         -------
         dict[output_name -> np.ndarray]
         """
-        # ── Upload inputs to GPU ──────────────────────────────────────────
-        for inp in self._inputs:
-            name = inp["name"]
-            arr  = np.ascontiguousarray(feed[name], dtype=inp["dtype"])
+        with self._lock:
+            # ── Upload inputs to GPU ──────────────────────────────────────────
+            for inp in self._inputs:
+                name = inp["name"]
+                arr  = np.ascontiguousarray(feed[name], dtype=inp["dtype"])
 
-            # Handle dynamic batch / spatial dims
-            actual_shape = arr.shape
-            if actual_shape != inp["static_shape"]:
-                nbytes = arr.nbytes
-                if nbytes > inp["nbytes"]:
-                    # Reallocate if input grew (unlikely for fixed 576x576)
-                    _cuda_free(inp["gpu_ptr"])
-                    inp["gpu_ptr"] = _cuda_malloc(nbytes)
-                    inp["nbytes"]  = nbytes
-                inp["static_shape"] = actual_shape
+                # Handle dynamic batch / spatial dims
+                actual_shape = arr.shape
+                if actual_shape != inp["static_shape"]:
+                    nbytes = arr.nbytes
+                    if nbytes > inp["nbytes"]:
+                        _cuda_free(inp["gpu_ptr"])
+                        inp["gpu_ptr"] = _cuda_malloc(nbytes)
+                        inp["nbytes"]  = nbytes
+                    inp["static_shape"] = actual_shape
+
+                # Unconditionally set input shape for TensorRT 10 context shape compatibility
                 self._context.set_input_shape(name, actual_shape)
+                self._context.set_tensor_address(name, inp["gpu_ptr"])
+                _cuda_h2d(inp["gpu_ptr"], arr)
 
-            self._context.set_tensor_address(name, inp["gpu_ptr"])
-            _cuda_h2d(inp["gpu_ptr"], arr)
 
-        # ── Set output tensor addresses ───────────────────────────────────
-        for out in self._outputs:
-            # After set_input_shape, query real output shape
-            real_shape = tuple(self._context.get_tensor_shape(out["name"]))
-            real_shape = tuple(max(d, 1) for d in real_shape)
-            nbytes = int(np.prod(real_shape)) * np.dtype(out["dtype"]).itemsize
-            if nbytes > out["nbytes"]:
-                _cuda_free(out["gpu_ptr"])
-                out["gpu_ptr"] = _cuda_malloc(nbytes)
-                out["nbytes"]  = nbytes
-            out["real_shape"] = real_shape
-            self._context.set_tensor_address(out["name"], out["gpu_ptr"])
+            # ── Set output tensor addresses ───────────────────────────────────
+            for out in self._outputs:
+                real_shape = tuple(self._context.get_tensor_shape(out["name"]))
+                real_shape = tuple(max(d, 1) for d in real_shape)
+                nbytes = int(np.prod(real_shape)) * np.dtype(out["dtype"]).itemsize
+                if nbytes > out["nbytes"]:
+                    _cuda_free(out["gpu_ptr"])
+                    out["gpu_ptr"] = _cuda_malloc(nbytes)
+                    out["nbytes"]  = nbytes
+                out["real_shape"] = real_shape
+                self._context.set_tensor_address(out["name"], out["gpu_ptr"])
 
-        # ── Execute ───────────────────────────────────────────────────────
-        ok = self._context.execute_async_v3(self._stream)
-        if not ok:
-            raise RuntimeError("TRT execute_async_v3 returned False")
-        _cuda_stream_sync(self._stream)
+            # ── Execute ───────────────────────────────────────────────────────
+            ok = self._context.execute_async_v3(self._stream)
+            if not ok:
+                raise RuntimeError("TRT execute_async_v3 returned False")
+            _cuda_stream_sync(self._stream)
 
-        # ── Download outputs to CPU ───────────────────────────────────────
-        results: Dict[str, np.ndarray] = {}
-        for out in self._outputs:
-            shape = out.get("real_shape", out["static_shape"])
-            arr   = np.empty(shape, dtype=out["dtype"])
-            _cuda_d2h(arr, out["gpu_ptr"])
-            results[out["name"]] = arr
+            # ── Download outputs to CPU ───────────────────────────────────────
+            results: Dict[str, np.ndarray] = {}
+            for out in self._outputs:
+                shape = out.get("real_shape", out["static_shape"])
+                arr   = np.empty(shape, dtype=out["dtype"])
+                _cuda_d2h(arr, out["gpu_ptr"])
+                results[out["name"]] = arr
 
         return results
+
+    def infer_pytorch(self, feed: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Run forward pass using PyTorch CUDA tensors directly (zero-copy).
+        Thread-safe: GPU execution is serialised by the internal lock.
+
+        Parameters
+        ----------
+        feed : dict[input_name -> torch.Tensor]  (float32, cuda, contiguous)
+
+        Returns
+        -------
+        dict[output_name -> torch.Tensor]
+        """
+        with self._lock:
+            # ── Bind input tensor addresses ───────────────────────────────────
+            for inp in self._inputs:
+                name = inp["name"]
+                tensor = feed[name]
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+
+                # Always set input shape for TensorRT 10 context compatibility
+                actual_shape = tuple(tensor.shape)
+                self._context.set_input_shape(name, actual_shape)
+                inp["static_shape"] = actual_shape
+
+                self._context.set_tensor_address(name, tensor.data_ptr())
+
+            # ── Allocate output PyTorch tensors and bind them ─────────────────
+            outputs: Dict[str, torch.Tensor] = {}
+            for out in self._outputs:
+                name = out["name"]
+                real_shape = tuple(self._context.get_tensor_shape(name))
+                real_shape = tuple(max(d, 1) for d in real_shape)
+
+                # Map numpy dtype to torch dtype
+                np_dtype = out["dtype"]
+                if np_dtype == np.float32:
+                    torch_dtype = torch.float32
+                elif np_dtype == np.float16:
+                    torch_dtype = torch.float16
+                elif np_dtype == np.int32:
+                    torch_dtype = torch.int32
+                elif np_dtype == np.int8:
+                    torch_dtype = torch.int8
+                elif np_dtype == np.bool_:
+                    torch_dtype = torch.bool
+                else:
+                    torch_dtype = torch.float32
+
+                # Create PyTorch tensor directly on GPU (no CPU copy/malloc overhead)
+                out_tensor = torch.empty(real_shape, dtype=torch_dtype, device='cuda')
+                self._context.set_tensor_address(name, out_tensor.data_ptr())
+                outputs[name] = out_tensor
+
+            # ── Execute TRT context ───────────────────────────────────────────
+            ok = self._context.execute_async_v3(self._stream)
+            if not ok:
+                raise RuntimeError("TRT execute_async_v3 returned False")
+            _cuda_stream_sync(self._stream)
+
+        return outputs
+
+
 
     def destroy(self):
         """Free all GPU buffers and CUDA stream."""

@@ -1,156 +1,126 @@
-pipeline:
-  px_to_mm: 0.15 # legacy, keep for backwards compatibility if needed
-  alerts_log: "log/alerts.log"
-  fallback_to_heuristic: true
-  save_snapshots: true
-  alerts_json_dir: "alerts/json"
-  alerts_snapshot_dir: "alerts/snapshot"
-  min_consecutive_frames: 4
-  force_split_segmentation: false # If true, forces the pipeline to run the separate U-Net segmenter instead of using the detector's masks
-  enable_detection: true
-  enable_segmentation: true
-  enable_gate: false
-
-gate:
-  checkpoint: null
-  threshold: 0.5
-  input_size: [224, 224]
-
-detector:
-  # Native TRT engine (fastest — pre-compiled FP16, instant startup, no ORT overhead)
-  # To use ONNX via ORT: change to "model/rfdetr-seg-medium.onnx"
-  # To use PyTorch (CPU): change to "model/seg.pth"
-  checkpoint_ema: "model/rfdetr-seg-medium-fp16.engine"
-  threshold: 0.5
-  input_size: [576, 576]  # Must match engine export shape
-  target_classes: ["crack", "rebar", "spall"]
-
-segmenter:
-  checkpoint: null 
-  input_size: [256, 256]
-  fallback_to_heuristic: true
-
-geometry:
-  pixel_per_mm: 10.0
-  min_length_px: 20
-  min_area_px: 50
-  sample_interval: 5
-  min_eccentricity: 0.6 # legacy
-
-severity:
-  level_1:
-    max_width_mm: 0.2
-    max_length_mm: 20.0
-    action: "Monitor and log during routine checkups"
-    reinspection_days: 180
-  level_2:
-    max_width_mm: 0.5
-    max_length_mm: 50.0
-    action: "Schedule repair/maintenance within 30 days"
-    reinspection_days: 30
-  level_3:
-    action: "emergency maintenance"
-    reinspection_days: 0
-
-alerting: # legacy alerting config
+alerting:
   cooldowns:
     2: 7200
     3: 600
-
 cameras:
-  # Performance Tuning:
-  # frame_skip: Controls how many frames to skip before processing. 
-  # Higher values (e.g., 2, 3) reduce CPU/GPU load but lower temporal resolution.
-
-  # - id: cam_1
-  #   source: 2
-  #   name: "Brio Webcam"
-  #   enabled: true
-  #   use_gstreamer: false
-
-  - id: cam_2
-    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX1"
-    enabled: true
-    use_gstreamer: true
-    codec: "h265"
-    protocols: "tcp"
-    latency: 0
-    drop_on_latency: true
-    playback_fps: 0
-    frame_skip: 1  # Process every frame. Set to 2 if GPU is overloaded.
-
-  - id: cam_3
-    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX2"
-    enabled: true
-    use_gstreamer: true
-    codec: "h265"
-    protocols: "tcp"
-    latency: 0
-    drop_on_latency: true
-    playback_fps: 0
-    frame_skip: 1  # Process every frame. Set to 2 if GPU is overloaded.
-    
-
-  - id: cam_4
-    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX1"
-    enabled: true
-    use_gstreamer: true
-    codec: "h265"
-    protocols: "tcp"
-    latency: 0
-    drop_on_latency: true
-    playback_fps: 0
-    frame_skip: 2  # Process every 2nd frame. Increase to 3 if still lagging.
-
-  - id: cam_5
-    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX2"
-    enabled: true
-    use_gstreamer: true
-    codec: "h265"
-    protocols: "tcp"
-    latency: 0
-    drop_on_latency: true
-    playback_fps: 0
-    frame_skip: 2  # Process every 2nd frame. Increase to 3 if still lagging.
-    
-  - id: cam_6
-    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX1"
-    enabled: true
-    use_gstreamer: true
-    codec: "h265"
-    protocols: "tcp"
-    latency: 0
-    drop_on_latency: true
-    playback_fps: 0
-    frame_skip: 2  # Process every 2nd frame. Increase to 3 if still lagging.
-
-  - id: cam_7
-    source: "rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2"
-    name: "LOREX2"
-    enabled: true
-    use_gstreamer: true
-    codec: "h265"
-    protocols: "tcp"
-    latency: 0
-    drop_on_latency: true
-    playback_fps: 0
-    frame_skip: 2  # Process every 2nd frame. Increase to 3 if still lagging.
-
-
-  # - id: cam_video
-  #   source: "/home/vivek/Downloads/vecteezy_construction-engineer-photographing-cracked-wall_75011916.mp4"
-  #   name: "Video Test"
-  #   enabled: true
-  #   use_gstreamer: false
-  #   playback_fps: 25.0 
-  #   frame_skip: 5 # Process every Nth frame to speed up playback/processing
-
-  # - id: cam_image
-  #   source: "/home/vivek/Downloads/imagy-split-image-2026-05-18/ChatGPT Image May 18, 2026, 12_44_27 PM_r4_c5.png"    
-  #   name: "Image Test"
-  #   playback_fps: 1.0
+- codec: h265
+  drop_on_latency: true
+  enabled: true
+  frame_skip: 1
+  id: cam_2
+  latency: 0
+  name: LOREX1
+  playback_fps: 0
+  protocols: tcp
+  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+  use_gstreamer: true
+- codec: h265
+  drop_on_latency: true
+  enabled: true
+  frame_skip: 1
+  id: cam_3
+  latency: 0
+  name: LOREX2
+  playback_fps: 0
+  protocols: tcp
+  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+  use_gstreamer: true
+- codec: h265
+  drop_on_latency: true
+  enabled: true
+  frame_skip: 1
+  id: cam_4
+  latency: 0
+  name: LOREX1
+  playback_fps: 0
+  protocols: tcp
+  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+  use_gstreamer: true
+- codec: h265
+  drop_on_latency: true
+  enabled: true
+  frame_skip: 1
+  id: cam_5
+  latency: 0
+  name: LOREX2
+  playback_fps: 0
+  protocols: tcp
+  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+  use_gstreamer: true
+- codec: h265
+  drop_on_latency: true
+  enabled: true
+  frame_skip: 1
+  id: cam_6
+  latency: 0
+  name: LOREX1
+  playback_fps: 0
+  protocols: tcp
+  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+  use_gstreamer: true
+- codec: h265
+  drop_on_latency: true
+  enabled: true
+  frame_skip: 1
+  id: cam_7
+  latency: 0
+  name: LOREX2
+  playback_fps: 0
+  protocols: tcp
+  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+  use_gstreamer: true
+detector:
+  checkpoint_ema: model/rfdetr-seg-medium-fp16.engine
+  input_size:
+  - 576
+  - 576
+  target_classes:
+  - crack
+  - rebar
+  - spall
+  threshold: 0.5
+gate:
+  checkpoint: null
+  input_size:
+  - 224
+  - 224
+  threshold: 0.35
+geometry:
+  min_area_px: 50
+  min_eccentricity: 0.6
+  min_length_px: 20
+  pixel_per_mm: 10.0
+  sample_interval: 5
+pipeline:
+  alerts_json_dir: alerts/json
+  alerts_log: log/alerts.log
+  alerts_snapshot_dir: alerts/snapshot
+  enable_detection: true
+  enable_gate: true
+  enable_segmentation: true
+  fallback_to_heuristic: true
+  force_split_segmentation: false
+  min_consecutive_frames: 4
+  pool_workers: 4
+  px_to_mm: 0.15
+  save_snapshots: true
+segmenter:
+  checkpoint: null
+  fallback_to_heuristic: true
+  input_size:
+  - 256
+  - 256
+severity:
+  level_1:
+    action: Monitor and log during routine checkups
+    max_length_mm: 20.0
+    max_width_mm: 0.2
+    reinspection_days: 180
+  level_2:
+    action: Schedule repair/maintenance within 30 days
+    max_length_mm: 50.0
+    max_width_mm: 0.5
+    reinspection_days: 30
+  level_3:
+    action: emergency maintenance
+    reinspection_days: 0

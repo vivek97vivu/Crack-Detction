@@ -3,10 +3,15 @@ from __future__ import annotations
 import logging
 import subprocess
 import os
+import time
 from functools import lru_cache
 from typing import Optional
 
 import cv2
+
+# Set GStreamer log level to 1 (ERROR only) to suppress harmless RTSP stream end / loop warnings
+if "GST_DEBUG" not in os.environ:
+    os.environ["GST_DEBUG"] = "1"
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +87,7 @@ _TEMPLATES: dict[str, dict[str, str]] = {
         "h265": (
             "rtspsrc location=\"{url}\" protocols={protocols} "
             "latency={latency} drop-on-latency={drop} buffer-mode=0 ! "
-            "rtph265depay ! h265parse ! nvv4l2decoder ! "
+            "rtph265depay ! h265parse ! nvv4l2decoder enable-max-performance=1 ! "
             "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
@@ -90,7 +95,7 @@ _TEMPLATES: dict[str, dict[str, str]] = {
         "h264": (
             "rtspsrc location=\"{url}\" protocols={protocols} "
             "latency={latency} drop-on-latency={drop} buffer-mode=0 ! "
-            "rtph264depay ! h264parse ! nvv4l2decoder ! "
+            "rtph264depay ! h264parse ! nvv4l2decoder enable-max-performance=1 ! "
             "nvvidconv ! video/x-raw,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
@@ -168,8 +173,11 @@ _TEMPLATES: dict[str, dict[str, str]] = {
     },
 }
 
-# Decoder fallback order — if preferred decoder fails, try the next
-_DECODER_FALLBACK_ORDER = ["jetson_hw", "nvidia_gpu", "vaapi", "software"]
+import platform
+
+# Decoder fallback order — Jetson ARM platform uses jetson_hw -> software fallback
+_IS_ARM = platform.machine().lower() in ("aarch64", "arm64")
+_DECODER_FALLBACK_ORDER = ["jetson_hw", "software"] if _IS_ARM else ["nvidia_gpu", "vaapi", "software"]
 
 
 # ── Public API ────────────────────────────────────────────────────────
@@ -240,36 +248,37 @@ def build_gstreamer_capture(camera_config: dict) -> cv2.VideoCapture:
             decoder=decoder_tier,
         )
 
-        logger.info(
-            "[%s] Trying GStreamer capture — decoder=%s codec=%s",
-            cam_id, decoder_tier, codec_key,
-        )
-
-        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-
-        if not cap.isOpened():
-            logger.warning(
-                "[%s] decoder=%s failed to open — trying next tier.",
-                cam_id, decoder_tier,
+        # Retry up to 3 times to allow NVDEC/VIC hardware contexts to settle during burst startup
+        for attempt in range(3):
+            logger.info(
+                "[%s] Trying GStreamer capture — decoder=%s codec=%s (attempt %d/3)",
+                cam_id, decoder_tier, codec_key, attempt + 1,
             )
-            cap.release()
-            continue
 
-        # Verify frames actually flow (isOpened() can return True on broken pipelines)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            logger.warning(
-                "[%s] decoder=%s opened but first frame read failed — trying next tier.",
-                cam_id, decoder_tier,
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+            if not cap.isOpened():
+                cap.release()
+                time.sleep(0.05)
+                continue
+
+            # Verify frames actually flow (isOpened() can return True on broken pipelines)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                cap.release()
+                time.sleep(0.05)
+                continue
+
+            logger.info(
+                "[%s] GStreamer capture OK — decoder=%s  %dx%d",
+                cam_id, decoder_tier, frame.shape[1], frame.shape[0],
             )
-            cap.release()
-            continue
+            return cap
 
-        logger.info(
-            "[%s] GStreamer capture OK — decoder=%s  %dx%d",
-            cam_id, decoder_tier, frame.shape[1], frame.shape[0],
+        logger.warning(
+            "[%s] decoder=%s failed to open after 3 attempts — trying next tier.",
+            cam_id, decoder_tier,
         )
-        return cap
 
     logger.error(
         "[%s] All GStreamer decoder tiers failed for codec=%s.",

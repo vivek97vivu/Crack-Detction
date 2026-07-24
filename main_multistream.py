@@ -1,15 +1,4 @@
-"""
-main_multistream.py — Multi-camera parallel inference on Jetson AGX Orin.
 
-Loads the RF-DETR detector, gate, and segmenter models ONCE and shares them
-across all enabled camera threads, minimising GPU memory and load-time.
-
-Usage:
-    conda activate crack
-    python main_multistream.py [--config config/config.yaml]
-
-Press 'q' in any display window to quit all streams.
-"""
 
 import cv2
 import numpy as np
@@ -21,6 +10,7 @@ import logging
 import threading
 import warnings
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
@@ -112,7 +102,7 @@ def open_camera(camera_cfg: dict):
 class CameraWorker(threading.Thread):
     def __init__(self, camera_cfg, config_path,
                  shared_gate, shared_detector, shared_segmenter,
-                 latest_frames, stop_event):
+                 latest_frames, stop_event, inference_pool):
         super().__init__(daemon=True)
         self.camera_cfg       = camera_cfg
         self.cam_id           = camera_cfg.get("id", "cam")
@@ -123,7 +113,10 @@ class CameraWorker(threading.Thread):
         self.shared_segmenter = shared_segmenter
         self.latest_frames    = latest_frames   # shared dict: cam_id -> annotated_frame
         self.stop_event       = stop_event
+        self.inference_pool   = inference_pool  # ThreadPoolExecutor shared across all cameras
         self.fps              = 0.0
+        self.total_frames     = 0              # for 60s benchmark summary
+        self.start_time       = None
 
     def run(self):
         cam_id = self.cam_id
@@ -145,6 +138,7 @@ class CameraWorker(threading.Thread):
         frame_count = 0
         fps_count   = 0
         fps_t0      = time.time()
+        self.start_time = fps_t0
 
         logger.info("[%s] Stream started (frame_skip=%d)", cam_id, frame_skip)
 
@@ -160,19 +154,29 @@ class CameraWorker(threading.Thread):
                 if frame_count % frame_skip != 0:
                     continue
 
-                frame_id  = f"{cam_id}_frame_{frame_count}"
-                annotated, _ = pipeline.process_frame(frame, frame_id=frame_id)
+                frame_id = f"{cam_id}_frame_{frame_count}"
 
-                # FPS counter
+                # Submit inference to shared pool — serialises GPU calls cleanly
+                future = self.inference_pool.submit(
+                    pipeline.process_frame, frame.copy(), frame_id
+                )
+                try:
+                    annotated, _ = future.result(timeout=5.0)
+                except Exception as exc:
+                    logger.warning("[%s] Inference error: %s", cam_id, exc)
+                    continue
+
+                # FPS accounting
+                self.total_frames += 1
                 fps_count += 1
-                elapsed    = time.time() - fps_t0
+                elapsed = time.time() - fps_t0
                 if elapsed >= 1.0:
                     self.fps  = fps_count / elapsed
                     fps_count = 0
                     fps_t0    = time.time()
                     logger.info("[%s] Inference %.1f FPS", cam_id, self.fps)
 
-                # Overlay FPS label on frame
+                # Overlay FPS
                 cv2.putText(
                     annotated,
                     f"{self.cam_name} | INF {self.fps:.1f} FPS",
@@ -180,7 +184,6 @@ class CameraWorker(threading.Thread):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 128), 2, cv2.LINE_AA,
                 )
 
-                # Share latest annotated frame for display thread
                 self.latest_frames[cam_id] = annotated
 
         finally:
@@ -224,6 +227,8 @@ def main():
     config      = load_config(args.config)
     cameras_cfg = config.get("cameras", [])
     enabled     = [c for c in cameras_cfg if c.get("enabled", True)]
+    p_cfg       = config.get("pipeline", {})
+    pool_workers = max(1, p_cfg.get("pool_workers", 4))
 
     if not enabled:
         print("[Error] No enabled cameras found in config. Exiting.")
@@ -231,6 +236,14 @@ def main():
 
     print(f"\nInitializing shared models for {len(enabled)} camera(s)...")
     shared_gate, shared_detector, shared_segmenter = load_shared_models(config)
+
+    # Shared inference pool — throttles concurrent GPU submissions
+    inference_pool = ThreadPoolExecutor(
+        max_workers=pool_workers,
+        thread_name_prefix="inf_worker",
+    )
+    logger.info("Inference pool created — pool_workers=%d cameras=%d",
+                pool_workers, len(enabled))
 
     latest_frames = {}
     stop_event    = threading.Event()
@@ -245,6 +258,7 @@ def main():
             shared_segmenter=shared_segmenter,
             latest_frames=latest_frames,
             stop_event=stop_event,
+            inference_pool=inference_pool,
         )
         workers.append(w)
 
@@ -281,11 +295,33 @@ def main():
         stop_event.set()
         for w in workers:
             w.join(timeout=3.0)
+        inference_pool.shutdown(wait=False)
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
+
+        # ── 60-second benchmark summary ───────────────────────────────────
+        now = time.time()
+        print("\n" + "─" * 68)
+        print(f"  BENCHMARK SUMMARY  |  pool_workers={pool_workers}  |  cameras={len(workers)}")
+        print("─" * 68)
+        print(f"  {'Camera':<10} {'Frames':>8} {'Elapsed(s)':>12} {'Avg FPS':>10}")
+        print("─" * 68)
+        total_f = 0
+        for w in workers:
+            elapsed = max(1.0, (now - w.start_time) if w.start_time else 1.0)
+            avg_fps = w.total_frames / elapsed
+            total_f += w.total_frames
+            print(f"  {w.cam_id:<10} {w.total_frames:>8} {elapsed:>12.1f} {avg_fps:>10.2f}")
+        print("─" * 68)
+        total_elapsed = max(1.0, (now - min(
+            (w.start_time for w in workers if w.start_time), default=now
+        )))
+        print(f"  {'TOTAL':<10} {total_f:>8} {total_elapsed:>12.1f} {total_f/total_elapsed:>10.2f}")
+        print("─" * 68)
         print("All streams stopped.")
+
 
 
 if __name__ == "__main__":
