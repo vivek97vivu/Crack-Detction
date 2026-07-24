@@ -14,8 +14,11 @@ import numpy as np
 import yaml
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, base_dir)
-sys.path.insert(0, os.path.join(base_dir, "src"))
+project_root = os.path.abspath(os.path.join(base_dir, ".."))
+os.chdir(project_root)
+
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
 from src.inference.pipeline import CrackDetectionPipeline
 

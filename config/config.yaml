@@ -1,126 +1,156 @@
-alerting:
-  cooldowns:
-    2: 7200
-    3: 600
-cameras:
-- codec: h265
-  drop_on_latency: true
-  enabled: true
-  frame_skip: 1
-  id: cam_2
-  latency: 0
-  name: LOREX1
-  playback_fps: 0
-  protocols: tcp
-  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
-  use_gstreamer: true
-- codec: h265
-  drop_on_latency: true
-  enabled: true
-  frame_skip: 1
-  id: cam_3
-  latency: 0
-  name: LOREX2
-  playback_fps: 0
-  protocols: tcp
-  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
-  use_gstreamer: true
-- codec: h265
-  drop_on_latency: true
-  enabled: true
-  frame_skip: 1
-  id: cam_4
-  latency: 0
-  name: LOREX1
-  playback_fps: 0
-  protocols: tcp
-  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
-  use_gstreamer: true
-- codec: h265
-  drop_on_latency: true
-  enabled: true
-  frame_skip: 1
-  id: cam_5
-  latency: 0
-  name: LOREX2
-  playback_fps: 0
-  protocols: tcp
-  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
-  use_gstreamer: true
-- codec: h265
-  drop_on_latency: true
-  enabled: true
-  frame_skip: 1
-  id: cam_6
-  latency: 0
-  name: LOREX1
-  playback_fps: 0
-  protocols: tcp
-  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
-  use_gstreamer: true
-- codec: h265
-  drop_on_latency: true
-  enabled: true
-  frame_skip: 1
-  id: cam_7
-  latency: 0
-  name: LOREX2
-  playback_fps: 0
-  protocols: tcp
-  source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
-  use_gstreamer: true
+# ------------------------------------------------------------------------------
+# 1. PIPELINE GENERAL CONTROL
+# ------------------------------------------------------------------------------
+pipeline:
+  enable_gate: true                 # MobileNetV3 
+  enable_detection: true            # RF-DETR 
+  enable_segmentation: true         # Sub-mm geometry post-processing
+  
+  pool_workers: 4                   # Parallel CPU worker threads for stream handling
+  min_consecutive_frames: 4         # Frames defect must persist to trigger alert
+  force_split_segmentation: false   # Use RF-DETR's 2D mask directly (True = force crop mode)
+  
+  save_snapshots: true              # Save annotated visual defect snapshots
+  alerts_json_dir: alerts/json      # Output folder for structured JSON alert logs
+  alerts_snapshot_dir: alerts/snapshot # Output folder for snapshot images
+  alerts_log: log/alerts.log        # Master pipeline text log file
+
+# ------------------------------------------------------------------------------
+# 2. STAGE 1: GATE CLASSIFIER (MobileNetV3-Small)
+# ------------------------------------------------------------------------------
+gate:
+  checkpoint: null                  
+  threshold: 0.45                   
+  input_size:
+    - 224
+    - 224
+
+# ------------------------------------------------------------------------------
+# 3. STAGE 2: DETECTOR & INSTANCE SEGMENTATION (RF-DETR TensorRT FP16)
+# ------------------------------------------------------------------------------
 detector:
   checkpoint_ema: model/rfdetr-seg-medium-fp16.engine
+  threshold: 0.45                   
   input_size:
-  - 576
-  - 576
+    - 576
+    - 576
   target_classes:
-  - crack
-  - rebar
-  - spall
-  threshold: 0.5
-gate:
-  checkpoint: null
-  input_size:
-  - 224
-  - 224
-  threshold: 0.35
-geometry:
-  min_area_px: 50
-  min_eccentricity: 0.6
-  min_length_px: 20
-  pixel_per_mm: 10.0
-  sample_interval: 5
-pipeline:
-  alerts_json_dir: alerts/json
-  alerts_log: log/alerts.log
-  alerts_snapshot_dir: alerts/snapshot
-  enable_detection: true
-  enable_gate: true
-  enable_segmentation: true
-  fallback_to_heuristic: true
-  force_split_segmentation: false
-  min_consecutive_frames: 4
-  pool_workers: 4
-  px_to_mm: 0.15
-  save_snapshots: true
+    - crack
+    - rebar
+    - spall
+
+# ------------------------------------------------------------------------------
+# 4. STAGE 3: POST-PROCESSING GEOMETRY ENGINE
+# ------------------------------------------------------------------------------
 segmenter:
-  checkpoint: null
-  fallback_to_heuristic: true
+  checkpoint: null                  # Null = uses RF-DETR's 2D mask directly
+  fallback_to_heuristic: true       # Enables Otsu thresholding fallback for crops
   input_size:
-  - 256
-  - 256
+    - 256
+    - 256
+
+geometry:
+  pixel_per_mm: 10.0                # Camera calibration ratio (10 px = 1.0 mm)
+  min_length_px: 20                 # Minimum pixel length for valid crack
+  min_area_px: 50                   # Minimum pixel area for valid crack
+  min_eccentricity: 0.6             # Minimum elongation factor
+  sample_interval: 5                # Skeleton sampling stride for width calculation
+
+# ------------------------------------------------------------------------------
+# 5. DEFECT SEVERITY CLASSIFICATION
+# ------------------------------------------------------------------------------
 severity:
   level_1:
-    action: Monitor and log during routine checkups
     max_length_mm: 20.0
     max_width_mm: 0.2
+    action: "Monitor and log during routine checkups"
     reinspection_days: 180
   level_2:
-    action: Schedule repair/maintenance within 30 days
     max_length_mm: 50.0
     max_width_mm: 0.5
+    action: "Schedule repair/maintenance within 30 days"
     reinspection_days: 30
   level_3:
-    action: emergency maintenance
+    action: "Emergency maintenance required"
     reinspection_days: 0
+
+alerting:
+  cooldowns:
+    2: 7200                         # Level 2 alert cooldown (2 hours)
+    3: 600                          # Level 3 alert cooldown (10 mins)
+
+# ------------------------------------------------------------------------------
+# 6. CAMERA STREAMS & HARDWARE DECODING (RTSP Feeds)
+# ------------------------------------------------------------------------------
+cameras:
+  - id: cam_2
+    name: LOREX1
+    enabled: true
+    source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+    use_gstreamer: true
+    codec: h265
+    protocols: tcp
+    latency: 0
+    frame_skip: 1
+    playback_fps: 0
+    drop_on_latency: true
+
+  - id: cam_3
+    name: LOREX2
+    enabled: true
+    source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+    use_gstreamer: true
+    codec: h265
+    protocols: tcp
+    latency: 0
+    frame_skip: 1
+    playback_fps: 0
+    drop_on_latency: true
+
+  - id: cam_4
+    name: LOREX1
+    enabled: true
+    source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+    use_gstreamer: true
+    codec: h265
+    protocols: tcp
+    latency: 0
+    frame_skip: 1
+    playback_fps: 0
+    drop_on_latency: true
+
+  - id: cam_5
+    name: LOREX2
+    enabled: true
+    source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+    use_gstreamer: true
+    codec: h265
+    protocols: tcp
+    latency: 0
+    frame_skip: 1
+    playback_fps: 0
+    drop_on_latency: true
+
+  - id: cam_6
+    name: LOREX1
+    enabled: true
+    source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+    use_gstreamer: true
+    codec: h265
+    protocols: tcp
+    latency: 0
+    frame_skip: 1
+    playback_fps: 0
+    drop_on_latency: true
+
+  - id: cam_7
+    name: LOREX2
+    enabled: true
+    source: rtsp://admin:diffuse123@192.168.0.183:554/cam/realmonitor?channel=1&subtype=2
+    use_gstreamer: true
+    codec: h265
+    protocols: tcp
+    latency: 0
+    frame_skip: 1
+    playback_fps: 0
+    drop_on_latency: true

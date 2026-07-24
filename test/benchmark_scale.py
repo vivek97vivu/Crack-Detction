@@ -20,16 +20,21 @@ import psutil
 import numpy as np
 
 warnings.filterwarnings("ignore")
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+base_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(base_dir, ".."))
+os.chdir(project_root)
 
-from inference.pipeline import CrackDetectionPipeline
-from inference.detector import DetectorInference
-from inference.segmenter import SegmenterInference
-from inference.gate import GateInference
-from inference.scheduler import InferenceScheduler
-from utils.config import load_config, resolve_path
-from utils.capture import ThreadedVideoCapture
-from utils.gstreamer import build_gstreamer_capture
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
+
+from src.inference.pipeline import CrackDetectionPipeline
+from src.inference.detector import DetectorInference
+from src.inference.segmenter import SegmenterInference
+from src.inference.gate import GateInference
+from src.inference.scheduler import InferenceScheduler
+from src.utils.config import load_config, resolve_path
+from src.utils.capture import ThreadedVideoCapture
+from src.utils.gstreamer import build_gstreamer_capture
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("benchmark_scale")

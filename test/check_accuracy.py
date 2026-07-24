@@ -13,6 +13,14 @@ if os.path.exists(crack_python) and (sys.executable != crack_python or crack_lib
 import cv2
 import numpy as np
 import torch
+
+base_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(base_dir, ".."))
+os.chdir(project_root)
+
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
+
 from src.inference.detector import DetectorInference
 from src.inference.gate import GateInference
 
