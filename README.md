@@ -73,6 +73,8 @@ Here is a preview of the Crack Detection Pipeline in action, showing the detecti
 * 📏 **Sub-Millimeter Skeletonization**: Measures physical crack length (mm) and max width (mm) using skeleton thinning and distance transforms.
 * 🔁 **Redundancy Filter**: Prevents alert flooding by saving exactly one crop JPEG and one JSON metadata report per unique track ID.
 * 📝 **Compliance Mapping**: Automatically determines API 570/579 severity rankings (`LEVEL_1` to `LEVEL_3`) and recommended maintenance intervals.
+* 📂 **Structured JSON Logging**: Saves individual JSON reports and session history logs tracking timestamps, coordinates, geometries, and severity levels.
+* 🛡️ **Robust Grayscale Handling**: Automatically converts 2D grayscale camera feeds to 3-channel BGR frames on ingest to prevent overlay shape mismatch crashes.
 
 ---
 
@@ -179,6 +181,41 @@ python test/verify_pipeline_health.py
 python main.py
 ```
 
+### CLI Run Options
+
+```bash
+# Run default cameras configured in config.yaml
+python main.py
+
+# Run a specific camera stream
+python main.py --camera cam_2
+
+# Run with a custom config file
+python main.py --config config/custom_config.yaml
+```
+
+---
+
+## 🚨 Alert System
+
+### Stage 1 — Gating & Defect Filtering
+MobileNetV3 filters negative frames in **0.8 ms** (if `enable_gate` is active). Passing frames are processed by RF-DETR. Any non-target detections are discarded immediately to keep the system silent on clean structures.
+
+### Stage 2 — Geometry Measurement & API 570/579 Severity Analysis
+For each unique `track_id`, physical width and length metrics are calculated. If measurements exceed severity thresholds:
+* **Image Alert**: Saves the **full annotated frame** highlighting the crack path, bounding box, track ID, and severity badge to `alerts/snapshot/track_{track_id}.jpg`.
+* **JSON Alert**: Saves a detailed JSON metadata log detailing crack location, length, max width, orientation, and maintenance action recommendations to `alerts/json/track_{track_id}.json`.
+
+---
+
+## 📸 Output Structure
+
+| Directory / File | Contents |
+|---|---|
+| `alerts/snapshot/` | Full-frame annotated snapshots (.jpg) showing marked crack paths and badges |
+| `alerts/json/` | Track-specific alert data reports (.json) containing exact geometry and severity levels |
+| `log/alerts.log` | Central text log appending timestamped severity details and action recommendations |
+
 ---
 
 ## 📊 Jetson AGX Orin Performance & Scaling Benchmarks
@@ -233,6 +270,19 @@ sudo nvpmodel -m 0
 # Lock GPU clock to 1.30 GHz and CPU to 2.20 GHz
 sudo jetson_clocks
 ```
+
+---
+
+## 🧪 Key Engineering Decisions
+
+* **FFMPEG RTSP Fallback**: Protects production environments by automatically switching from GStreamer pipelines to direct OpenCV FFMPEG readers if local network or plugin issues occur.
+* **Warning Suppression**: Blocks package deprecation output to keep terminal streams clean and readable.
+* **Frame Skipping (`frame_skip`)**: Processes every $N$-th frame (e.g., 1 out of 5 frames), reducing CPU/GPU load to guarantee real-time performance on high-resolution video streams.
+* **Deduplicated Alerting**: Prevents alert flooding by logging exactly one snapshot and JSON report per unique track ID.
+* **Grayscale Auto-Conversion**: Prevents overlay dimension mismatches by converting grayscale camera streams to BGR formats on stream ingest.
+* **GPU Memory Optimization**: Implements dynamic batching and multi-engine TRT pooling in 6.2 GB RAM to prevent CUDA out-of-memory errors on 120 streams.
+
+---
 
 For complete technical logs, detailed architecture diagrams, and health audit reports, see **[observation_document.md](file:///home/algosium/.gemini/antigravity-ide/brain/2361cef8-d143-4b13-95ed-78ee76fdb08c/observation_document.md)**.
 
