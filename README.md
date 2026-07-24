@@ -22,10 +22,10 @@ A **production-grade AI pipeline** built for **real-time structural health monit
 
 ---
 
-## 📐 System Architecture Flowchart
+## 🚀 Pipeline Overview Diagram
 
 <div align="center">
-  <img src="diagram.png" alt="Crack Detection Pipeline Flowchart" width="850"/>
+  <img src="diagram.png" alt="Crack Detection Pipeline Architecture Flowchart" width="850"/>
 </div>
 
 ---
